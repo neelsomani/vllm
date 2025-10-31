@@ -553,6 +553,14 @@ class EngineArgs:
 
     kv_sharing_fast_prefill: bool = CacheConfig.kv_sharing_fast_prefill
 
+    # KV Marketplace flags
+    kv_marketplace: bool = False
+    """Enable KV marketplace for cross-GPU KV cache reuse."""
+    kv_min_prefix: int = 64
+    """Minimum prefix length (in tokens) required for KV cache import."""
+    kv_verify_logits: bool = False
+    """Verify that imported KV cache produces matching logits."""
+
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
         # without having to manually construct a
@@ -1093,6 +1101,30 @@ class EngineArgs:
         )
         vllm_group.add_argument(
             "--structured-outputs-config", **vllm_kwargs["structured_outputs_config"]
+        )
+
+        # KV Marketplace arguments
+        kv_marketplace_group = parser.add_argument_group(
+            title="KV Marketplace",
+            description="Options for cross-GPU KV cache reuse via kv-marketplace.",
+        )
+        kv_marketplace_group.add_argument(
+            "--kv-marketplace",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Enable KV marketplace for cross-GPU KV cache reuse.",
+        )
+        kv_marketplace_group.add_argument(
+            "--kv-min-prefix",
+            type=int,
+            default=64,
+            help="Minimum prefix length (in tokens) required for KV cache import. (default: 64)",
+        )
+        kv_marketplace_group.add_argument(
+            "--kv-verify-logits",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Verify that imported KV cache produces matching logits.",
         )
 
         # Other arguments

@@ -409,6 +409,41 @@ class KVCacheManager:
         """Get the block ids of a request."""
         return self.get_blocks(request_id).get_block_ids()
 
+    def materialize_prefix(self, request: Request, dst_alloc: dict, lcp_len: int) -> None:
+        """KV Marketplace: Materialize prefix KV cache pages.
+        
+        This is a stub method that should be implemented to actually install
+        the page-table entries/pointers for imported KV cache blocks.
+        
+        Args:
+            request: The request being processed
+            dst_alloc: AllocatedKV dict with k_ptrs and v_ptrs per layer
+            lcp_len: Length of the imported prefix
+        """
+        # TODO: Implement actual page-table installation
+        # This should mark the pages [0:lcp_len] as materialized with the given pointers
+        pass
+
+    def get_prefill_pages(self, request: Request) -> dict:
+        """KV Marketplace: Get KV cache page pointers for prefill region.
+        
+        Returns the page pointers for the prompt prefix that was just computed.
+        
+        Args:
+            request: The request that completed prefill
+            
+        Returns:
+            AllocatedKV dict with k_ptrs and v_ptrs per layer for [0:prompt_len]
+        """
+        # TODO: Implement actual pointer extraction
+        # This should return a dict with k_ptrs and v_ptrs lists per layer
+        prompt_len = getattr(request, "_orig_prompt_len", len(getattr(request, "prompt_token_ids", [])))
+        return {
+            "k_ptrs": [],
+            "v_ptrs": [],
+            "length": prompt_len,
+        }
+
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled."""
         if self.enable_caching:

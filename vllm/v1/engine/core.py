@@ -321,6 +321,22 @@ class EngineCore:
             scheduler_output, model_output
         )
 
+        # KV Marketplace: Export prefix KV cache after prefill completes
+        # Check for requests that just completed their prompt prefill
+        from vllm.kv_marketplace_hooks import _export_prefix
+        for new_req_data in scheduler_output.new_reqs_data:
+            req_id = new_req_data.request_id
+            request = self.scheduler.requests.get(req_id)
+            if request and request.num_computed_tokens > 0:
+                # Check if this request just finished its first prefill
+                # Use original prompt length (may have been sliced after import)
+                orig_len = getattr(request, "_orig_prompt_len", len(getattr(request, 'prompt_token_ids', [])))
+                if request.num_computed_tokens >= orig_len:
+                    # Only export once per request
+                    if not getattr(request, '_kv_marketplace_exported', False):
+                        _export_prefix(request, self.scheduler)
+                        request._kv_marketplace_exported = True
+
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
     def post_step(self, model_executed: bool) -> None:
@@ -472,6 +488,9 @@ class EngineCore:
             )
 
         req = Request.from_engine_core_request(request, self.request_block_hasher)
+        # KV Marketplace: Store original prompt length before any slicing
+        if hasattr(req, 'prompt_token_ids') and req.prompt_token_ids:
+            req._orig_prompt_len = len(req.prompt_token_ids)
         if req.use_structured_output:
             # Note on thread safety: no race condition.
             # `grammar_init` is only invoked in input processing thread. For
