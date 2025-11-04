@@ -324,8 +324,8 @@ class EngineCore:
         # KV Marketplace: Export prefix KV cache after prefill completes
         # Check for requests that just completed their prompt prefill
         from vllm.kv_marketplace_hooks import _export_prefix
-        for new_req_data in scheduler_output.new_reqs_data:
-            req_id = new_req_data.request_id
+        for new_req_data in scheduler_output.scheduled_new_reqs:
+            req_id = new_req_data.req_id
             request = self.scheduler.requests.get(req_id)
             if request and request.num_computed_tokens > 0:
                 # Check if this request just finished its first prefill
