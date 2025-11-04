@@ -323,19 +323,25 @@ class EngineCore:
 
         # KV Marketplace: Export prefix KV cache after prefill completes
         # Check for requests that just completed their prompt prefill
-        from vllm.kv_marketplace_hooks import _export_prefix
-        for new_req_data in scheduler_output.scheduled_new_reqs:
-            req_id = new_req_data.req_id
-            request = self.scheduler.requests.get(req_id)
-            if request and request.num_computed_tokens > 0:
-                # Check if this request just finished its first prefill
-                # Use original prompt length (may have been sliced after import)
-                orig_len = getattr(request, "_orig_prompt_len", len(getattr(request, 'prompt_token_ids', [])))
-                if request.num_computed_tokens >= orig_len:
-                    # Only export once per request
-                    if not getattr(request, '_kv_marketplace_exported', False):
-                        _export_prefix(request, self.scheduler)
-                        request._kv_marketplace_exported = True
+        try:
+            from vllm.kv_marketplace_hooks import _export_prefix
+            for new_req_data in scheduler_output.scheduled_new_reqs:
+                req_id = new_req_data.req_id
+                request = self.scheduler.requests.get(req_id)
+                if request and request.num_computed_tokens > 0:
+                    # Check if this request just finished its first prefill
+                    # Use original prompt length (may have been sliced after import)
+                    orig_len = getattr(request, "_orig_prompt_len", len(getattr(request, 'prompt_token_ids', [])) if getattr(request, 'prompt_token_ids', None) else 0)
+                    if orig_len > 0 and request.num_computed_tokens >= orig_len:
+                        # Only export once per request
+                        if not getattr(request, '_kv_marketplace_exported', False):
+                            _export_prefix(request, self.scheduler)
+                            request._kv_marketplace_exported = True
+        except Exception as e:
+            # Log error but don't crash the engine
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"kv-marketplace export hook failed: {e}", exc_info=True)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
