@@ -322,29 +322,22 @@ class EngineCore:
         )
 
         # KV Marketplace: Export prefix KV cache after prefill completes
-        # Temporarily disabled to debug engine crash
-        # TODO: Re-enable once we fix the logic for detecting completed prefill
-        # The issue is that scheduled_new_reqs contains newly scheduled requests,
-        # not necessarily requests that just finished prefill. Need better detection logic.
-        # try:
-        #     from vllm.kv_marketplace_hooks import _export_prefix
-        #     for new_req_data in scheduler_output.scheduled_new_reqs:
-        #         req_id = new_req_data.req_id
-        #         request = self.scheduler.requests.get(req_id)
-        #         if request and request.num_computed_tokens > 0:
-        #             # Check if this request just finished its first prefill
-        #             # Use original prompt length (may have been sliced after import)
-        #             orig_len = getattr(request, "_orig_prompt_len", len(getattr(request, 'prompt_token_ids', [])) if getattr(request, 'prompt_token_ids', None) else 0)
-        #             if orig_len > 0 and request.num_computed_tokens >= orig_len:
-        #                 # Only export once per request
-        #                 if not getattr(request, '_kv_marketplace_exported', False):
-        #                     _export_prefix(request, self.scheduler)
-        #                     request._kv_marketplace_exported = True
-        # except Exception as e:
-        #     # Log error but don't crash the engine
-        #     import logging
-        #     logger = logging.getLogger(__name__)
-        #     logger.warning(f"kv-marketplace export hook failed: {e}", exc_info=True)
+        # Only run if kv-marketplace is enabled
+        if getattr(self.vllm_config, 'kv_marketplace', False):
+            from vllm.kv_marketplace_hooks import _export_prefix
+            # Check all running requests to see if any just finished prefill
+            for request in self.scheduler.requests.values():
+                # Only export once per request, and only if it has computed tokens
+                if not getattr(request, '_kv_marketplace_exported', False) and request.num_computed_tokens > 0:
+                    # Check if this request just finished its first prefill
+                    # Use original prompt length (may have been sliced after import)
+                    prompt_token_ids = getattr(request, 'prompt_token_ids', None)
+                    orig_len = getattr(request, "_orig_prompt_len", len(prompt_token_ids) if prompt_token_ids else 0)
+                    # If num_computed_tokens equals or exceeds the original prompt length,
+                    # the prefill phase is complete
+                    if orig_len > 0 and request.num_computed_tokens >= orig_len:
+                        _export_prefix(request, self.scheduler)
+                        request._kv_marketplace_exported = True
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 

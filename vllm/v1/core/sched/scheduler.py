@@ -507,7 +507,8 @@ class Scheduler(SchedulerInterface):
 
                 # KV Marketplace: Attempt to import prefix KV cache before allocating blocks
                 # This hook runs before prefill allocation for new requests
-                if request.status == RequestStatus.WAITING:
+                # Only run if kv-marketplace is enabled
+                if request.status == RequestStatus.WAITING and getattr(self.vllm_config, 'kv_marketplace', False):
                     from vllm.kv_marketplace_hooks import _maybe_import_prefix
                     imported = _maybe_import_prefix(request, self)
                     # Note: The hook modifies request.prompt_token_ids and sets req.seq_pos
