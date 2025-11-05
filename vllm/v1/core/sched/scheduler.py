@@ -510,17 +510,9 @@ class Scheduler(SchedulerInterface):
                 # Only run if kv-marketplace is enabled
                 kv_marketplace_enabled = getattr(self.vllm_config, 'kv_marketplace', False)
                 request_waiting = request.status == RequestStatus.WAITING
-                if request_waiting:
-                    logger.info(
-                        f"kv-marketplace scheduler: request_id={request.request_id}, "
-                        f"status={request.status}, kv_marketplace={kv_marketplace_enabled}"
-                    )
                 if request_waiting and kv_marketplace_enabled:
-                    logger.info(f"kv-marketplace scheduler: Calling _maybe_import_prefix for request {request.request_id}")
                     from vllm.kv_marketplace_hooks import _maybe_import_prefix
                     imported = _maybe_import_prefix(request, self)
-                elif request_waiting and not kv_marketplace_enabled:
-                    logger.info(f"kv-marketplace scheduler: Skipping import (kv_marketplace=False) for request {request.request_id}")
                     # Note: The hook modifies request.prompt_token_ids and sets req.seq_pos
                     # The allocator is informed via materialize_prefix in the hook function
 

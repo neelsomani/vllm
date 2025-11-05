@@ -4,7 +4,7 @@
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Any, Literal, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
@@ -424,7 +424,7 @@ class KVCacheManager:
         # This should mark the pages [0:lcp_len] as materialized with the given pointers
         pass
 
-    def get_prefill_pages(self, request: Request) -> dict:
+    def get_prefill_pages(self, request: Request, engine_ctx: Any = None) -> dict:
         """KV Marketplace: Get KV cache page pointers for prefill region.
         
         Returns the page pointers for the prompt prefix that was just computed.
@@ -443,13 +443,7 @@ class KVCacheManager:
             prompt_token_ids = getattr(request, "prompt_token_ids", [])
             prompt_len = len(prompt_token_ids) if prompt_token_ids else 0
         
-        logger.debug(
-            f"kv-marketplace get_prefill_pages: request_id={request.request_id}, "
-            f"prompt_len={prompt_len}, _orig_prompt_len={getattr(request, '_orig_prompt_len', 'NOT_SET')}"
-        )
-        
         if prompt_len == 0:
-            logger.debug(f"kv-marketplace get_prefill_pages: prompt_len=0, returning empty")
             return {
                 "k_ptrs": [],
                 "v_ptrs": [],
@@ -459,17 +453,8 @@ class KVCacheManager:
         # Get the blocks allocated for this request
         request_blocks = self.get_blocks(request.request_id)
         
-        logger.debug(
-            f"kv-marketplace get_prefill_pages: request_blocks={request_blocks}, "
-            f"num_groups={len(request_blocks.blocks) if request_blocks else 0}, "
-            f"block_sizes={[len(group) for group in request_blocks.blocks] if request_blocks else []}"
-        )
-        
         if not request_blocks or all(len(group) == 0 for group in request_blocks.blocks):
             # No blocks allocated yet
-            logger.warning(
-                f"kv-marketplace get_prefill_pages: No blocks found for request {request.request_id}"
-            )
             return {
                 "k_ptrs": [],
                 "v_ptrs": [],
@@ -518,30 +503,79 @@ class KVCacheManager:
             }
         
         # Extract block IDs
-        # TODO: Convert block IDs to actual memory pointers using:
-        # - KV cache tensor base addresses from worker
-        # - Block layout (page_size_bytes, tensor shape)
-        # - Block ID to offset calculation
         block_ids = [block.block_id for block in prefill_blocks]
         
-        logger.debug(
-            f"kv-marketplace get_prefill_pages: Extracted {len(block_ids)} block IDs: {block_ids[:10]}"
-            f" (showing first 10), num_blocks_for_prefill={num_blocks_for_prefill}, "
-            f"block_size={block_size}"
-        )
+        # Convert block IDs to actual GPU memory pointers
+        k_ptrs = []
+        v_ptrs = []
         
-        # For now, return block IDs as placeholder pointers
-        # The adapter/plugin will need to convert these to actual addresses
-        # or we can add a conversion function that accesses the worker
-        # Structure: one pointer per block (for now - should be per layer eventually)
-        k_ptrs = block_ids.copy()
-        v_ptrs = block_ids.copy()
+        if engine_ctx is not None:
+            try:
+                # Get model_executor from engine_ctx (EngineCore)
+                model_executor = getattr(engine_ctx, "model_executor", None)
+                if model_executor is not None:
+                    # Get kv_caches - it's a list of tensors, one per layer
+                    # Each tensor is structured as (2, num_blocks, ...) for K and V
+                    if hasattr(model_executor, "kv_caches"):
+                        kv_caches_list = getattr(model_executor, "kv_caches")
+                        
+                        if isinstance(kv_caches_list, list) and len(kv_caches_list) > 0:
+                            # Get the first layer's KV cache tensor
+                            # For GPT-2, there's one tensor per layer
+                            kv_tensor = kv_caches_list[0]
+                            
+                            if kv_tensor is not None and hasattr(kv_tensor, 'data_ptr'):
+                                base_ptr = kv_tensor.data_ptr()
+                                tensor_shape = kv_tensor.shape
+                                tensor_stride = kv_tensor.stride()
+                                dtype_size = kv_tensor.element_size()
+                                
+                                # Get page_size_bytes from config
+                                page_size_bytes = None
+                                if self.kv_cache_config and len(self.kv_cache_config.kv_cache_groups) > 0:
+                                    first_group = self.kv_cache_config.kv_cache_groups[0]
+                                    page_size_bytes = first_group.kv_cache_spec.page_size_bytes
+                                else:
+                                    # Fallback: estimate from tensor size
+                                    # Total tensor size / number of blocks
+                                    if len(tensor_shape) > 1 and tensor_shape[1] > 0:
+                                        total_bytes = kv_tensor.numel() * dtype_size
+                                        num_blocks = tensor_shape[1]
+                                        page_size_bytes = total_bytes // (num_blocks * 2)  # Divide by 2 for K and V
+                                
+                                if page_size_bytes is not None:
+                                    # Determine K and V layout
+                                    # Most attention backends use (2, num_blocks, ...) where [0] is K and [1] is V
+                                    if len(tensor_shape) > 0 and tensor_shape[0] == 2:
+                                        # Layout is (2, num_blocks, ...) - K at [0], V at [1]
+                                        k_base = base_ptr
+                                        v_base = base_ptr + tensor_stride[0] * dtype_size
+                                        
+                                        # Blocks are in dimension 1
+                                        if len(tensor_stride) > 1:
+                                            block_stride = tensor_stride[1] * dtype_size
+                                        else:
+                                            block_stride = page_size_bytes
+                                        
+                                        for block_id in block_ids:
+                                            k_ptr = k_base + block_id * block_stride
+                                            v_ptr = v_base + block_id * block_stride
+                                            k_ptrs.append(k_ptr)
+                                            v_ptrs.append(v_ptr)
+                                    else:
+                                        # Unknown layout - try using page_size_bytes directly
+                                        for block_id in block_ids:
+                                            block_ptr = base_ptr + block_id * page_size_bytes
+                                            k_ptrs.append(block_ptr)
+                                            v_ptrs.append(block_ptr)
+            except Exception:
+                pass
         
-        logger.info(
-            f"kv-marketplace get_prefill_pages: Returning {len(k_ptrs)} K pointers and "
-            f"{len(v_ptrs)} V pointers for request {request.request_id}, length={prompt_len}"
-        )
-        
+        # Fallback to block IDs if pointer extraction failed
+        if not k_ptrs or not v_ptrs:
+            k_ptrs = block_ids.copy()
+            v_ptrs = block_ids.copy()
+
         return {
             "k_ptrs": k_ptrs,
             "v_ptrs": v_ptrs,

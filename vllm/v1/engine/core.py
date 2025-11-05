@@ -89,8 +89,6 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
-        kv_marketplace_value = getattr(vllm_config, 'kv_marketplace', 'NOT_SET')
-        logger.info(f"kv-marketplace EngineCore.__init__: kv_marketplace={kv_marketplace_value}, type={type(kv_marketplace_value)}")
         if vllm_config.parallel_config.data_parallel_rank == 0:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -325,14 +323,9 @@ class EngineCore:
 
         # KV Marketplace: Export prefix KV cache after prefill completes
         # Only run if kv-marketplace is enabled
-        from vllm.logger import init_logger
-        logger = init_logger(__name__)
-        
         kv_marketplace_enabled = getattr(self.vllm_config, 'kv_marketplace', False)
-        logger.info(f"kv-marketplace core: kv_marketplace={kv_marketplace_enabled}, num_requests={len(self.scheduler.requests)}")
         
         if kv_marketplace_enabled:
-            logger.info(f"kv-marketplace core: kv_marketplace is enabled, checking {len(self.scheduler.requests)} requests for export")
             from vllm.kv_marketplace_hooks import _export_prefix
             
             # Check all running requests to see if any just finished prefill
@@ -340,11 +333,6 @@ class EngineCore:
                 # Only export once per request, and only if it has computed tokens
                 already_exported = getattr(request, '_kv_marketplace_exported', False)
                 num_computed = getattr(request, 'num_computed_tokens', 0)
-                
-                logger.debug(
-                    f"kv-marketplace: Checking request {request.request_id}: "
-                    f"already_exported={already_exported}, num_computed_tokens={num_computed}"
-                )
                 
                 if not already_exported and num_computed > 0:
                     # Check if this request just finished its first prefill
@@ -355,32 +343,13 @@ class EngineCore:
                     if orig_len is None:
                         # Fallback to current prompt length
                         orig_len = len(prompt_token_ids) if prompt_token_ids else 0
-                        logger.debug(
-                            f"kv-marketplace: _orig_prompt_len not set for {request.request_id}, "
-                            f"using current length={orig_len}"
-                        )
-                    
-                    logger.debug(
-                        f"kv-marketplace: Request {request.request_id}: "
-                        f"orig_len={orig_len}, num_computed={num_computed}, "
-                        f"condition={orig_len > 0 and num_computed >= orig_len}"
-                    )
                     
                     # If num_computed_tokens equals or exceeds the original prompt length,
                     # the prefill phase is complete
                     if orig_len > 0 and num_computed >= orig_len:
-                        logger.info(
-                            f"kv-marketplace: Calling export for request {request.request_id} "
-                            f"(orig_len={orig_len}, num_computed={num_computed})"
-                        )
-                        _export_prefix(request, self.scheduler)
+                        # Pass self (EngineCore) instead of scheduler so we can access model_executor
+                        _export_prefix(request, self)
                         request._kv_marketplace_exported = True
-                    else:
-                        logger.debug(
-                            f"kv-marketplace: Skipping export for {request.request_id}: "
-                            f"orig_len={orig_len}, num_computed={num_computed}, "
-                            f"condition not met"
-                        )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -871,14 +840,10 @@ class EngineCoreProc(EngineCore):
             and not self.scheduler.has_requests()
             and not self.batch_queue
         ):
-            if logger.isEnabledFor(DEBUG) and self.input_queue.empty():
-                logger.debug("EngineCore waiting for work.")
+            if self.input_queue.empty():
                 waited = True
             req = self.input_queue.get()
             self._handle_client_request(*req)
-
-        if waited:
-            logger.debug("EngineCore loop active.")
 
         # Handle any more client requests.
         while not self.input_queue.empty():
