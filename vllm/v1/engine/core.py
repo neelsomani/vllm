@@ -89,6 +89,8 @@ class EngineCore:
         load_general_plugins()
 
         self.vllm_config = vllm_config
+        kv_marketplace_value = getattr(vllm_config, 'kv_marketplace', 'NOT_SET')
+        logger.info(f"kv-marketplace EngineCore.__init__: kv_marketplace={kv_marketplace_value}, type={type(kv_marketplace_value)}")
         if vllm_config.parallel_config.data_parallel_rank == 0:
             logger.info(
                 "Initializing a V1 LLM engine (v%s) with config: %s",
@@ -323,21 +325,62 @@ class EngineCore:
 
         # KV Marketplace: Export prefix KV cache after prefill completes
         # Only run if kv-marketplace is enabled
-        if getattr(self.vllm_config, 'kv_marketplace', False):
+        from vllm.logger import init_logger
+        logger = init_logger(__name__)
+        
+        kv_marketplace_enabled = getattr(self.vllm_config, 'kv_marketplace', False)
+        logger.info(f"kv-marketplace core: kv_marketplace={kv_marketplace_enabled}, num_requests={len(self.scheduler.requests)}")
+        
+        if kv_marketplace_enabled:
+            logger.info(f"kv-marketplace core: kv_marketplace is enabled, checking {len(self.scheduler.requests)} requests for export")
             from vllm.kv_marketplace_hooks import _export_prefix
+            
             # Check all running requests to see if any just finished prefill
             for request in self.scheduler.requests.values():
                 # Only export once per request, and only if it has computed tokens
-                if not getattr(request, '_kv_marketplace_exported', False) and request.num_computed_tokens > 0:
+                already_exported = getattr(request, '_kv_marketplace_exported', False)
+                num_computed = getattr(request, 'num_computed_tokens', 0)
+                
+                logger.debug(
+                    f"kv-marketplace: Checking request {request.request_id}: "
+                    f"already_exported={already_exported}, num_computed_tokens={num_computed}"
+                )
+                
+                if not already_exported and num_computed > 0:
                     # Check if this request just finished its first prefill
                     # Use original prompt length (may have been sliced after import)
                     prompt_token_ids = getattr(request, 'prompt_token_ids', None)
-                    orig_len = getattr(request, "_orig_prompt_len", len(prompt_token_ids) if prompt_token_ids else 0)
+                    orig_len = getattr(request, "_orig_prompt_len", None)
+                    
+                    if orig_len is None:
+                        # Fallback to current prompt length
+                        orig_len = len(prompt_token_ids) if prompt_token_ids else 0
+                        logger.debug(
+                            f"kv-marketplace: _orig_prompt_len not set for {request.request_id}, "
+                            f"using current length={orig_len}"
+                        )
+                    
+                    logger.debug(
+                        f"kv-marketplace: Request {request.request_id}: "
+                        f"orig_len={orig_len}, num_computed={num_computed}, "
+                        f"condition={orig_len > 0 and num_computed >= orig_len}"
+                    )
+                    
                     # If num_computed_tokens equals or exceeds the original prompt length,
                     # the prefill phase is complete
-                    if orig_len > 0 and request.num_computed_tokens >= orig_len:
+                    if orig_len > 0 and num_computed >= orig_len:
+                        logger.info(
+                            f"kv-marketplace: Calling export for request {request.request_id} "
+                            f"(orig_len={orig_len}, num_computed={num_computed})"
+                        )
                         _export_prefix(request, self.scheduler)
                         request._kv_marketplace_exported = True
+                    else:
+                        logger.debug(
+                            f"kv-marketplace: Skipping export for {request.request_id}: "
+                            f"orig_len={orig_len}, num_computed={num_computed}, "
+                            f"condition not met"
+                        )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 

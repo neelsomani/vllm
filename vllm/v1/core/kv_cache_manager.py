@@ -435,9 +435,21 @@ class KVCacheManager:
         Returns:
             AllocatedKV dict with k_ptrs and v_ptrs per layer for [0:prompt_len]
         """
-        prompt_len = getattr(request, "_orig_prompt_len", len(getattr(request, "prompt_token_ids", [])))
+        from vllm.logger import init_logger
+        logger = init_logger(__name__)
+        
+        prompt_len = getattr(request, "_orig_prompt_len", None)
+        if prompt_len is None:
+            prompt_token_ids = getattr(request, "prompt_token_ids", [])
+            prompt_len = len(prompt_token_ids) if prompt_token_ids else 0
+        
+        logger.debug(
+            f"kv-marketplace get_prefill_pages: request_id={request.request_id}, "
+            f"prompt_len={prompt_len}, _orig_prompt_len={getattr(request, '_orig_prompt_len', 'NOT_SET')}"
+        )
         
         if prompt_len == 0:
+            logger.debug(f"kv-marketplace get_prefill_pages: prompt_len=0, returning empty")
             return {
                 "k_ptrs": [],
                 "v_ptrs": [],
@@ -447,8 +459,17 @@ class KVCacheManager:
         # Get the blocks allocated for this request
         request_blocks = self.get_blocks(request.request_id)
         
+        logger.debug(
+            f"kv-marketplace get_prefill_pages: request_blocks={request_blocks}, "
+            f"num_groups={len(request_blocks.blocks) if request_blocks else 0}, "
+            f"block_sizes={[len(group) for group in request_blocks.blocks] if request_blocks else []}"
+        )
+        
         if not request_blocks or all(len(group) == 0 for group in request_blocks.blocks):
             # No blocks allocated yet
+            logger.warning(
+                f"kv-marketplace get_prefill_pages: No blocks found for request {request.request_id}"
+            )
             return {
                 "k_ptrs": [],
                 "v_ptrs": [],
@@ -503,12 +524,23 @@ class KVCacheManager:
         # - Block ID to offset calculation
         block_ids = [block.block_id for block in prefill_blocks]
         
+        logger.debug(
+            f"kv-marketplace get_prefill_pages: Extracted {len(block_ids)} block IDs: {block_ids[:10]}"
+            f" (showing first 10), num_blocks_for_prefill={num_blocks_for_prefill}, "
+            f"block_size={block_size}"
+        )
+        
         # For now, return block IDs as placeholder pointers
         # The adapter/plugin will need to convert these to actual addresses
         # or we can add a conversion function that accesses the worker
         # Structure: one pointer per block (for now - should be per layer eventually)
         k_ptrs = block_ids.copy()
         v_ptrs = block_ids.copy()
+        
+        logger.info(
+            f"kv-marketplace get_prefill_pages: Returning {len(k_ptrs)} K pointers and "
+            f"{len(v_ptrs)} V pointers for request {request.request_id}, length={prompt_len}"
+        )
         
         return {
             "k_ptrs": k_ptrs,

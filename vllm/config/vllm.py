@@ -103,6 +103,10 @@ class VllmConfig:
     """The configurations for distributed KV cache transfer."""
     kv_events_config: KVEventsConfig | None = None
     """The configurations for event publishing."""
+    kv_marketplace: bool = False
+    """Enable KV marketplace for cross-GPU KV cache reuse."""
+    kv_min_prefix: int = 64
+    """Minimum prefix length (in tokens) required for KV cache import."""
     # some opaque config, only used to provide additional information
     # for the hash computation, mainly used for testing, debugging or out of
     # tree config registration.

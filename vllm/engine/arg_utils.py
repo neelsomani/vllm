@@ -1721,6 +1721,8 @@ class EngineArgs:
             compilation_config=self.compilation_config,
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
+            kv_marketplace=self.kv_marketplace,
+            kv_min_prefix=self.kv_min_prefix,
             additional_config=self.additional_config,
         )
 

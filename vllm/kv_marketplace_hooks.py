@@ -287,8 +287,26 @@ def make_export_ctx(
         
         # Try to get actual KV cache pointers if available
         kv_cache_manager = getattr(engine_ctx, "kv_cache_manager", None)
+        logger = _get_logger()
+        logger.debug(
+            f"kv-marketplace make_export_ctx: request_id={req.request_id if hasattr(req, 'request_id') else 'unknown'}, "
+            f"kv_cache_manager={kv_cache_manager is not None}, "
+            f"has_get_prefill_pages={hasattr(kv_cache_manager, 'get_prefill_pages') if kv_cache_manager else False}"
+        )
+        
         if kv_cache_manager and hasattr(kv_cache_manager, "get_prefill_pages"):
+            logger.debug(f"kv-marketplace make_export_ctx: Calling get_prefill_pages for request {req.request_id if hasattr(req, 'request_id') else 'unknown'}")
             kv_pages = kv_cache_manager.get_prefill_pages(req)
+            logger.debug(
+                f"kv-marketplace make_export_ctx: get_prefill_pages returned: "
+                f"length={kv_pages.get('length', 0)}, "
+                f"k_ptrs={len(kv_pages.get('k_ptrs', []))}, "
+                f"v_ptrs={len(kv_pages.get('v_ptrs', []))}"
+            )
+        else:
+            logger.warning(
+                f"kv-marketplace make_export_ctx: kv_cache_manager not available or missing get_prefill_pages method"
+            )
         
         # Ensure we use the correct length
         length = kv_pages.get("length", prompt_len)
@@ -333,8 +351,13 @@ def _maybe_import_prefix(
     Returns:
         Tuple of (lcp_len, dst_alloc) if import succeeds, None otherwise
     """
+    logger = _get_logger()
+    request_id = req.request_id if hasattr(req, 'request_id') else 'unknown'
+    logger.info(f"kv-marketplace: _maybe_import_prefix called for request {request_id}")
+    
     plugin = load_plugin()
     if not plugin:
+        logger.warning("kv-marketplace: Plugin not loaded, cannot import prefix")
         return None
     
     # Check if kv-marketplace is enabled
@@ -342,12 +365,19 @@ def _maybe_import_prefix(
     if flags is None:
         flags = getattr(engine_ctx, "flags", None)
     
+    kv_marketplace_enabled = getattr(flags, "kv_marketplace", None) if flags else None
+    logger.info(f"kv-marketplace: flags={flags is not None}, kv_marketplace={kv_marketplace_enabled}")
+    
     if not flags or not getattr(flags, "kv_marketplace", False):
+        logger.warning(f"kv-marketplace: kv_marketplace not enabled in config (flags={flags is not None}, kv_marketplace={kv_marketplace_enabled})")
         return None
     
     ctx_dict = make_import_ctx(req, engine_ctx)
     if ctx_dict is None:
+        logger.warning(f"kv-marketplace: make_import_ctx returned None for request {request_id}")
         return None
+    
+    logger.info(f"kv-marketplace: make_import_ctx succeeded for request {request_id}, length={ctx_dict.get('length', 0)}")
     
     try:
         # Call the plugin's before_prefill function
@@ -389,27 +419,45 @@ def _export_prefix(
         req: The request that just completed prefill
         engine_ctx: Engine context
     """
+    logger = _get_logger()
+    request_id = req.request_id if hasattr(req, 'request_id') else 'unknown'
+    logger.info(f"kv-marketplace: _export_prefix called for request {request_id}")
+    
     plugin = load_plugin()
     if not plugin:
+        logger.warning("kv-marketplace: Plugin not loaded, cannot export prefix")
         return
     
     flags = getattr(engine_ctx, "vllm_config", None)
     if flags is None:
         flags = getattr(engine_ctx, "flags", None)
     
+    kv_marketplace_enabled = getattr(flags, "kv_marketplace", None) if flags else None
+    logger.info(f"kv-marketplace: flags={flags is not None}, kv_marketplace={kv_marketplace_enabled}")
+    
     if not flags or not getattr(flags, "kv_marketplace", False):
+        logger.warning(f"kv-marketplace: kv_marketplace not enabled in config (flags={flags is not None}, kv_marketplace={kv_marketplace_enabled})")
         return
     
     ctx_dict = make_export_ctx(req, engine_ctx)
     if ctx_dict is None:
+        logger.warning(f"kv-marketplace: make_export_ctx returned None for request {request_id}")
         return
     
+    logger.info(f"kv-marketplace: make_export_ctx succeeded for request {request_id}, length={ctx_dict.get('length', 0)}")
+    
     try:
+        logger.debug(
+            f"kv-marketplace: Calling after_prefill for request {req.request_id if hasattr(req, 'request_id') else 'unknown'}, "
+            f"length={ctx_dict.get('length', 0)}, "
+            f"k_ptrs_len={len(ctx_dict.get('kv_pages', {}).get('k_ptrs', []))}, "
+            f"v_ptrs_len={len(ctx_dict.get('kv_pages', {}).get('v_ptrs', []))}"
+        )
         plugin.after_prefill(ctx_dict)
-        _get_logger().info(
+        logger.info(
             f"kv-marketplace: Exported prefix of length {ctx_dict['length']} for request {req.request_id if hasattr(req, 'request_id') else 'unknown'}"
         )
     except Exception as e:
         _get_logger().warning(
-            f"kv-marketplace after_prefill failed: {e}"
+            f"kv-marketplace after_prefill failed: {e}", exc_info=True
         )
