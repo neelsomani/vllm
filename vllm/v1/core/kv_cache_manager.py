@@ -435,12 +435,84 @@ class KVCacheManager:
         Returns:
             AllocatedKV dict with k_ptrs and v_ptrs per layer for [0:prompt_len]
         """
-        # TODO: Implement actual pointer extraction
-        # This should return a dict with k_ptrs and v_ptrs lists per layer
         prompt_len = getattr(request, "_orig_prompt_len", len(getattr(request, "prompt_token_ids", [])))
+        
+        if prompt_len == 0:
+            return {
+                "k_ptrs": [],
+                "v_ptrs": [],
+                "length": 0,
+            }
+        
+        # Get the blocks allocated for this request
+        request_blocks = self.get_blocks(request.request_id)
+        
+        if not request_blocks or all(len(group) == 0 for group in request_blocks.blocks):
+            # No blocks allocated yet
+            return {
+                "k_ptrs": [],
+                "v_ptrs": [],
+                "length": prompt_len,
+            }
+        
+        # Calculate number of blocks needed for prefill region
+        # Use the first KV cache group's block size (they should all be the same)
+        block_size = self.block_size
+        if block_size is None:
+            # Fallback: try to get from config
+            if self.kv_cache_config and len(self.kv_cache_config.kv_cache_groups) > 0:
+                block_size = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+            else:
+                # Default block size
+                block_size = 16
+        
+        num_blocks_for_prefill = (prompt_len + block_size - 1) // block_size  # Ceiling division
+        
+        # Get block IDs for the prefill region (first num_blocks_for_prefill blocks)
+        # NOTE: We return block IDs as placeholder pointers. The actual pointer calculation
+        # requires access to the worker's KV cache tensor base addresses, which is not
+        # available in the scheduler context. The actual implementation should:
+        # 1. Get KV cache tensor base addresses from the worker/model_executor
+        # 2. Calculate pointer = base_address + block_id * page_size_bytes for each block
+        # 3. Return one pointer per layer for K and V caches
+        
+        # Get the first KV cache group's blocks (most models have one group)
+        # For multi-group models, we'd need to handle each group separately
+        if len(request_blocks.blocks) == 0:
+            return {
+                "k_ptrs": [],
+                "v_ptrs": [],
+                "length": prompt_len,
+            }
+        
+        # Use the first group's blocks (typically all layers share the same block allocation)
+        block_group = request_blocks.blocks[0]
+        prefill_blocks = block_group[:num_blocks_for_prefill]
+        
+        if not prefill_blocks:
+            return {
+                "k_ptrs": [],
+                "v_ptrs": [],
+                "length": prompt_len,
+            }
+        
+        # Extract block IDs
+        # TODO: Convert block IDs to actual memory pointers using:
+        # - KV cache tensor base addresses from worker
+        # - Block layout (page_size_bytes, tensor shape)
+        # - Block ID to offset calculation
+        block_ids = [block.block_id for block in prefill_blocks]
+        
+        # For now, return block IDs as placeholder pointers
+        # The adapter/plugin will need to convert these to actual addresses
+        # or we can add a conversion function that accesses the worker
+        # Structure: one pointer per block (for now - should be per layer eventually)
+        k_ptrs = block_ids.copy()
+        v_ptrs = block_ids.copy()
+        
         return {
-            "k_ptrs": [],
-            "v_ptrs": [],
+            "k_ptrs": k_ptrs,
+            "v_ptrs": v_ptrs,
             "length": prompt_len,
         }
 
