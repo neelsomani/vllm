@@ -278,6 +278,55 @@ def _allocator_closure(engine_ctx: Any, device_id: int, req: "Request"):
     return alloc_prefix
 
 
+def _get_cached_engine_ctx_data(engine_ctx: Any, device_id: int):
+    """Cache heavy, request-invariant data (compat/layout/stream) on engine_ctx."""
+    cache = getattr(engine_ctx, "_kv_mkt_cached_ctx", None)
+    if cache is None:
+        cache = {
+            "compat_obj": None,
+            "layout": None,
+            "stream_ptrs": {},
+        }
+        setattr(engine_ctx, "_kv_mkt_cached_ctx", cache)
+
+    if cache.get("compat_obj") is None:
+        compat_dict = _compat_from_ctx(engine_ctx)
+        cache["compat_dict"] = compat_dict
+        if KVCompat is not None:
+            cache["compat_obj"] = KVCompat(
+                model_params=compat_dict.get("model_params", {}),
+                tokenizer_config=compat_dict.get("tokenizer_config", {}),
+                rope_config=compat_dict.get("rope_config", {}),
+                layout_config=compat_dict.get("kv_layout", {}),
+            )
+        else:
+            cache["compat_obj"] = compat_dict
+
+    if cache.get("layout") is None:
+        cache["layout"] = _layout_from_ctx(engine_ctx)
+
+    stream_ptrs = cache.setdefault("stream_ptrs", {})
+    if device_id not in stream_ptrs:
+        stream_ptrs[device_id] = _get_prefill_stream_ptr(device_id)
+
+    return cache["compat_obj"], cache["layout"], stream_ptrs[device_id]
+
+
+def warm_kv_marketplace_ctx(engine_ctx: Any) -> None:
+    """Eagerly populate cached ctx data so the first request avoids the cost."""
+    plugin = load_plugin()
+    if not plugin:
+        return
+
+    try:
+        device_id = _device_id_from_ctx(engine_ctx)
+        _get_cached_engine_ctx_data(engine_ctx, device_id)
+    except Exception as exc:
+        _get_logger().debug(
+            "kv-marketplace warm_kv_marketplace_ctx skipped: %s", exc
+        )
+
+
 def make_import_ctx(
     req: "Request",
     engine_ctx: Any,  # EngineCore or similar
@@ -314,22 +363,8 @@ def make_import_ctx(
         if not hasattr(req, "_orig_prompt_token_ids"):
             req._orig_prompt_token_ids = list(tokens)  # Make a copy
         
-        compat_dict = _compat_from_ctx(engine_ctx)
-        layout = _layout_from_ctx(engine_ctx)
+        compat, layout, stream = _get_cached_engine_ctx_data(engine_ctx, device_id)
         alloc_prefix = _allocator_closure(engine_ctx, device_id, req)
-        stream = _get_prefill_stream_ptr(device_id)
-        
-        # Convert compat dict to KVCompat object
-        if KVCompat is not None:
-            compat = KVCompat(
-                model_params=compat_dict.get("model_params", {}),
-                tokenizer_config=compat_dict.get("tokenizer_config", {}),
-                rope_config=compat_dict.get("rope_config", {}),
-                layout_config=compat_dict.get("kv_layout", {})
-            )
-        else:
-            # Fallback if KVCompat not available
-            compat = compat_dict
         
         return {
             "device_id": device_id,
@@ -384,9 +419,8 @@ def make_export_ctx(
             tokens = current_tokens
             prompt_len = len(tokens)
         
-        compat_dict = _compat_from_ctx(engine_ctx)
-        layout = _layout_from_ctx(engine_ctx)
-        
+        compat, layout, _ = _get_cached_engine_ctx_data(engine_ctx, device_id)
+
         # Pull the pages/pointers the allocator just filled during prefill
         kv_pages = {"k_ptrs": [], "v_ptrs": [], "length": prompt_len}
         
@@ -405,18 +439,6 @@ def make_export_ctx(
         
         # Ensure we use the correct length
         length = kv_pages.get("length", prompt_len)
-        
-        # Convert compat dict to KVCompat object
-        if KVCompat is not None:
-            compat = KVCompat(
-                model_params=compat_dict.get("model_params", {}),
-                tokenizer_config=compat_dict.get("tokenizer_config", {}),
-                rope_config=compat_dict.get("rope_config", {}),
-                layout_config=compat_dict.get("kv_layout", {})
-            )
-        else:
-            # Fallback if KVCompat not available
-            compat = compat_dict
         
         return {
             "device_id": device_id,

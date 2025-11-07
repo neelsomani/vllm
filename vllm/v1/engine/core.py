@@ -198,6 +198,17 @@ class EngineCore:
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
 
+        if getattr(self.vllm_config, "kv_marketplace", False):
+            try:
+                from vllm.kv_marketplace_hooks import warm_kv_marketplace_ctx
+
+                warm_kv_marketplace_ctx(self)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to warm kv-marketplace context on engine core: %s",
+                    exc,
+                )
+
     def _initialize_kv_caches(
         self, vllm_config: VllmConfig
     ) -> tuple[int, int, KVCacheConfig]:

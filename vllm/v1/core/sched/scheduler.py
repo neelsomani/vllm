@@ -179,6 +179,17 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
+        if getattr(self.vllm_config, "kv_marketplace", False):
+            try:
+                from vllm.kv_marketplace_hooks import warm_kv_marketplace_ctx
+
+                warm_kv_marketplace_ctx(self)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to warm kv-marketplace context on scheduler: %s",
+                    exc,
+                )
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
