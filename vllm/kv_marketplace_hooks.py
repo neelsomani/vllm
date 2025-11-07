@@ -44,9 +44,17 @@ def _device_id_from_ctx(engine_ctx: Any) -> int:
 def _compat_from_ctx(engine_ctx: Any):
     """Build KVCompat-compatible dict from engine context."""
     cfg = getattr(engine_ctx, "vllm_config", None) or getattr(engine_ctx, "config", None)
-    mc = getattr(cfg, "model_config", None) if cfg else None
-    cc = getattr(cfg, "cache_config", None) if cfg else None
+    if cfg is None:
+        raise RuntimeError("[kv-mkt] engine_ctx has no vllm_config/config")
+    
+    mc = getattr(cfg, "model_config", None)
+    cc = getattr(cfg, "cache_config", None)
     tok = getattr(cfg, "tokenizer", None) or getattr(cfg, "tokenizer_config", None)
+    
+    if mc is None:
+        raise RuntimeError("[kv-mkt] model_config is None")
+    if cc is None:
+        raise RuntimeError("[kv-mkt] cache_config is None")
 
     # Extract RoPE configuration separately
     rope_base = getattr(mc, "rope_theta", None) or getattr(mc, "rope_base", None)
@@ -57,38 +65,156 @@ def _compat_from_ctx(engine_ctx: Any):
     if rope_scaling is not None:
         rope_config["rope_scaling"] = rope_scaling
 
+    # Use getters - access hf_text_config for total values
+    hf_text_config = getattr(mc, "hf_text_config", None)
+    if hf_text_config is None:
+        raise RuntimeError("[kv-mkt] model_config has no hf_text_config")
+    
+    n_layers = getattr(hf_text_config, "num_hidden_layers", None) or getattr(hf_text_config, "n_layers", None)
+    if n_layers is None:
+        raise RuntimeError("[kv-mkt] Failed to extract n_layers from hf_text_config")
+    
+    hidden_size = mc.get_hidden_size()
+    if hidden_size is None or hidden_size == 0:
+        raise RuntimeError(f"[kv-mkt] get_hidden_size() returned invalid value: {hidden_size}")
+    
+    n_kv_heads = mc.get_total_num_kv_heads()
+    if n_kv_heads is None or n_kv_heads == 0:
+        raise RuntimeError(f"[kv-mkt] get_total_num_kv_heads() returned invalid value: {n_kv_heads}")
+    
+    head_dim = mc.get_head_size()
+    if head_dim is None or head_dim == 0:
+        n_heads = getattr(hf_text_config, "num_attention_heads", None) or getattr(hf_text_config, "n_heads", None)
+        if n_heads is None or n_heads == 0:
+            raise RuntimeError("[kv-mkt] Failed to extract n_heads for head_dim calculation")
+        head_dim = hidden_size // n_heads
+        if head_dim == 0:
+            raise RuntimeError(f"[kv-mkt] Computed head_dim is 0: hidden_size={hidden_size}, n_heads={n_heads}")
+    
+    vocab_size = None
+    if tok and getattr(tok, "vocab_size", None):
+        vocab_size = tok.vocab_size
+    else:
+        try:
+            vocab_size = mc.get_vocab_size()
+        except Exception:
+            pass
+
+    page_size = getattr(cc, "block_size", None) or getattr(cc, "page_size", None)
+    if page_size is None or page_size == 0:
+        raise RuntimeError("[kv-mkt] Failed to extract page_size from cache_config")
+    
+    dtype = getattr(cc, "cache_dtype", None) or getattr(cc, "dtype", None)
+    if dtype is None:
+        raise RuntimeError("[kv-mkt] Failed to extract dtype from cache_config")
+    dtype = str(dtype)
+
     return {
         "model_params": {
-            "n_layers": getattr(mc, "num_hidden_layers", None) or getattr(mc, "n_layers", None),
-            "hidden_size": getattr(mc, "hidden_size", None),
-            "n_kv_heads": getattr(mc, "num_key_value_heads", None) or getattr(mc, "n_kv_heads", None),
-            "head_dim": getattr(mc, "head_dim", None),
+            "n_layers": n_layers,
+            "hidden_size": hidden_size,
+            "n_kv_heads": n_kv_heads,
+            "head_dim": head_dim,
             "alibi": getattr(mc, "alibi", False),
         },
         "tokenizer_config": {
             "name_or_path": getattr(tok, "name_or_path", None) if tok else None,
             "normalizer": getattr(tok, "normalizer", None) if tok else None,
-            "vocab_size": getattr(tok, "vocab_size", None) or getattr(mc, "vocab_size", None) if mc else None,
+            "vocab_size": vocab_size,
         },
         "rope_config": rope_config,
         "kv_layout": {
-            "page_size": getattr(cc, "block_size", None) or getattr(cc, "page_size", None),
-            "dtype": str(getattr(cc, "cache_dtype", None) or getattr(cc, "dtype", None)),
+            "page_size": page_size,
+            "dtype": dtype,
             "layout": "paged",
         },
     }
 
 
 def _layout_from_ctx(engine_ctx: Any):
-    """Extract KV layout from engine context."""
+    """Extract KV layout from engine context.
+    
+    Uses vLLM ModelConfig getters to extract layout information.
+    """
     cfg = getattr(engine_ctx, "vllm_config", None) or getattr(engine_ctx, "config", None)
-    mc = getattr(cfg, "model_config", None) if cfg else None
-    cc = getattr(cfg, "cache_config", None) if cfg else None
+    if cfg is None:
+        raise RuntimeError(f"[kv-mkt] engine_ctx has no vllm_config/config: {type(engine_ctx)}")
+    
+    mc = getattr(cfg, "model_config", None)
+    cc = getattr(cfg, "cache_config", None)
+    
+    if mc is None:
+        raise RuntimeError(f"[kv-mkt] engine_ctx.config.model_config is None (cfg={cfg})")
+    if cc is None:
+        raise RuntimeError(f"[kv-mkt] engine_ctx.config.cache_config is None (cfg={cfg})")
+
+    # Use vLLM accessors. These are the source of truth.
+    hf_text_config = getattr(mc, "hf_text_config", None)
+    if hf_text_config is None:
+        raise RuntimeError("[kv-mkt] model_config has no hf_text_config")
+    
+    try:
+        # Get total values from hf_text_config (not per-GPU values)
+        n_layers = getattr(hf_text_config, "num_hidden_layers", None) or getattr(hf_text_config, "n_layers", None)
+        if n_layers is None or n_layers == 0:
+            raise RuntimeError("[kv-mkt] Failed to extract n_layers from hf_text_config")
+        
+        n_heads = getattr(hf_text_config, "num_attention_heads", None) or getattr(hf_text_config, "n_heads", None)
+        if n_heads is None or n_heads == 0:
+            raise RuntimeError("[kv-mkt] Failed to extract n_heads from hf_text_config")
+        
+        # Use getter for total KV heads
+        n_kv_heads = mc.get_total_num_kv_heads()
+        if n_kv_heads is None or n_kv_heads == 0:
+            # Fallback to hf_text_config attributes
+            n_kv_heads = (getattr(hf_text_config, "num_key_value_heads", None) or
+                         getattr(hf_text_config, "num_kv_heads", None) or
+                         getattr(hf_text_config, "n_head_kv", None) or
+                         n_heads)
+        if n_kv_heads is None or n_kv_heads == 0:
+            raise RuntimeError("[kv-mkt] Failed to extract n_kv_heads")
+        
+        # Use getter for head_dim
+        head_dim = mc.get_head_size()
+    except Exception as e:
+        raise RuntimeError(f"[kv-mkt] failed to read ModelConfig via getters: {e}")
+
+    # Head dim fallback if getter not implemented by a backend
+    if head_dim is None or head_dim == 0:
+        hidden_size = mc.get_hidden_size()
+        if hidden_size is None or hidden_size == 0:
+            raise RuntimeError(f"[kv-mkt] get_hidden_size() returned invalid value: {hidden_size}")
+        if n_heads is None or n_heads == 0:
+            raise RuntimeError(f"[kv-mkt] n_heads is invalid: {n_heads}")
+        head_dim = hidden_size // n_heads
+        if head_dim == 0:
+            raise RuntimeError(f"[kv-mkt] Computed head_dim is 0: hidden_size={hidden_size}, n_heads={n_heads}")
+
+    # Page size from cache_config, with fallback to kv_cache_manager.block_size
+    page_size = getattr(cc, "block_size", None) or getattr(cc, "page_size", None)
+    if page_size is None or page_size == 0:
+        kvm = None
+        if hasattr(engine_ctx, "scheduler"):
+            kvm = getattr(engine_ctx.scheduler, "kv_cache_manager", None)
+        if not kvm:
+            kvm = getattr(engine_ctx, "kv_cache_manager", None)
+        page_size = getattr(kvm, "block_size", None)
+        if page_size is None or page_size == 0:
+            raise RuntimeError("[kv-mkt] Failed to extract page_size from cache_config or kv_cache_manager")
+
+    # Validate all values are valid integers > 0
+    for k, v in {
+        "n_layers": n_layers, "n_kv_heads": n_kv_heads,
+        "head_dim": head_dim, "page_size": page_size,
+    }.items():
+        if not isinstance(v, int) or v <= 0:
+            raise RuntimeError(f"[kv-mkt] invalid {k}={v}")
+
     return {
-        "n_layers": getattr(mc, "num_hidden_layers", None) or getattr(mc, "n_layers", 0) if mc else 0,
-        "n_kv_heads": getattr(mc, "num_key_value_heads", None) or getattr(mc, "n_kv_heads", 0) if mc else 0,
-        "head_dim": getattr(mc, "head_dim", 0) if mc else 0,
-        "page_size": getattr(cc, "block_size", 0) or getattr(cc, "page_size", 0) if cc else 0,
+        "n_layers": n_layers,
+        "n_kv_heads": n_kv_heads,
+        "head_dim": head_dim,
+        "page_size": page_size,
         "strides": {},
     }
 
@@ -134,45 +260,51 @@ def _allocator_closure(engine_ctx: Any, device_id: int, req: "Request"):
         k_ptrs, v_ptrs = [], []
         
         if kv_cache_manager is None:
-            _get_logger().warning("kv_cache_manager not available for prefix allocation")
-            return {"k_ptrs": k_ptrs, "v_ptrs": v_ptrs, "length": length}
+            raise RuntimeError("kv_cache_manager not available; cannot allocate prefix")
         
-        try:
-            # Calculate number of blocks needed
-            block_size = getattr(kv_cache_manager, "block_size", None)
-            if block_size is None or block_size == 0:
-                _get_logger().warning(f"Invalid block_size: {block_size}")
-                return {"k_ptrs": k_ptrs, "v_ptrs": v_ptrs, "length": length}
-            
-            num_blocks = (length + block_size - 1) // block_size
-            
-            # Allocate blocks using the cache manager
-            # We allocate a temporary set of blocks for the prefix
-            # The materialize_prefix method will later install these properly
-            from vllm.v1.request import Request as RequestType
-            from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-            from vllm.v1.core.kv_cache_utils import KVCacheBlock
-            
-            # Create a temporary request-like object to allocate blocks
-            # In practice, the blocks should be allocated as part of the normal flow
-            # but marked as "pre-allocated" for the prefix region
-            # For now, we return empty pointers - the actual allocation happens
-            # in the scheduler's allocate_slots, and materialize_prefix will
-            # install the imported data
-            
-            # Get layout info
-            cfg = getattr(engine_ctx, "vllm_config", None) or getattr(engine_ctx, "config", None)
-            mc = getattr(cfg, "model_config", None) if cfg else None
-            n_layers = getattr(mc, "num_hidden_layers", None) or getattr(mc, "n_layers", 0) if mc else 0
-            
-            # Initialize empty pointers per layer
-            # The actual pointers will be set by materialize_prefix
-            k_ptrs = [0] * n_layers
-            v_ptrs = [0] * n_layers
-            
-        except Exception as e:
-            _get_logger().warning(f"Error allocating prefix blocks: {e}", exc_info=True)
+        block_size = getattr(kv_cache_manager, "block_size", None)
+        if not isinstance(block_size, int) or block_size <= 0:
+            raise RuntimeError(f"invalid kv_cache_manager.block_size={block_size}")
+        # Calculate number of blocks needed
         
+        num_blocks = (length + block_size - 1) // block_size
+        
+        # Allocate blocks using the cache manager
+        # We allocate a temporary set of blocks for the prefix
+        # The materialize_prefix method will later install these properly
+        from vllm.v1.request import Request as RequestType
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+        from vllm.v1.core.kv_cache_utils import KVCacheBlock
+        
+        # Create a temporary request-like object to allocate blocks
+        # In practice, the blocks should be allocated as part of the normal flow
+        # but marked as "pre-allocated" for the prefix region
+        # For now, we return empty pointers - the actual allocation happens
+        # in the scheduler's allocate_slots, and materialize_prefix will
+        # install the imported data
+        
+        # Get layout info using the same getter pattern as _layout_from_ctx
+        cfg = getattr(engine_ctx, "vllm_config", None) or getattr(engine_ctx, "config", None)
+        if cfg is None:
+            raise RuntimeError("[kv-mkt] engine_ctx has no vllm_config/config")
+        
+        mc = getattr(cfg, "model_config", None)
+        if mc is None:
+            raise RuntimeError("[kv-mkt] model_config is None")
+        
+        # Use hf_text_config to get total n_layers (same pattern as _layout_from_ctx)
+        hf_text_config = getattr(mc, "hf_text_config", None)
+        if hf_text_config is None:
+            raise RuntimeError("[kv-mkt] model_config has no hf_text_config")
+        
+        n_layers = getattr(hf_text_config, "num_hidden_layers", None) or getattr(hf_text_config, "n_layers", None)
+        if n_layers is None or n_layers == 0:
+            raise RuntimeError("[kv-mkt] Failed to extract n_layers from hf_text_config")
+        
+        # Initialize empty pointers per layer
+        # The actual pointers will be set by materialize_prefix
+        k_ptrs = [0] * n_layers
+        v_ptrs = [0] * n_layers
         return {"k_ptrs": k_ptrs, "v_ptrs": v_ptrs, "length": length}
     
     return alloc_prefix
