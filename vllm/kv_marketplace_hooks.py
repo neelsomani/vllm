@@ -115,7 +115,12 @@ def _allocator_closure(engine_ctx: Any, device_id: int, req: "Request"):
     The blocks are allocated but not yet filled - the import will copy
     data into them.
     """
-    kv_cache_manager = getattr(engine_ctx, "kv_cache_manager", None)
+    # Mirror the export lookup: try scheduler first, then direct access
+    kv_cache_manager = None
+    if hasattr(engine_ctx, "scheduler"):
+        kv_cache_manager = getattr(engine_ctx.scheduler, "kv_cache_manager", None)
+    if kv_cache_manager is None:
+        kv_cache_manager = getattr(engine_ctx, "kv_cache_manager", None)
     
     def alloc_prefix(length: int):
         """Allocate KV cache blocks for the prefix.
@@ -134,7 +139,7 @@ def _allocator_closure(engine_ctx: Any, device_id: int, req: "Request"):
         
         try:
             # Calculate number of blocks needed
-            block_size = kv_cache_manager.block_size
+            block_size = getattr(kv_cache_manager, "block_size", None)
             if block_size is None or block_size == 0:
                 _get_logger().warning(f"Invalid block_size: {block_size}")
                 return {"k_ptrs": k_ptrs, "v_ptrs": v_ptrs, "length": length}
@@ -371,7 +376,12 @@ def _maybe_import_prefix(
                 req.prompt_token_ids = req.prompt_token_ids[lcp_len:]
             
             # Inform allocator that prefix pages are materialized
-            kv_cache_manager = getattr(engine_ctx, "kv_cache_manager", None)
+            # Mirror the export lookup: try scheduler first, then direct access
+            kv_cache_manager = None
+            if hasattr(engine_ctx, "scheduler"):
+                kv_cache_manager = getattr(engine_ctx.scheduler, "kv_cache_manager", None)
+            if kv_cache_manager is None:
+                kv_cache_manager = getattr(engine_ctx, "kv_cache_manager", None)
             if kv_cache_manager and hasattr(kv_cache_manager, "materialize_prefix"):
                 kv_cache_manager.materialize_prefix(req, dst_alloc, lcp_len)
             
