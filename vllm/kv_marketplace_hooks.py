@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Hooks and helpers for kv-marketplace integration."""
 
+import time
 import torch
 from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
 
@@ -247,6 +248,8 @@ def _allocator_closure(engine_ctx: Any, device_id: int, req: "Request"):
         kv_cache_manager = getattr(engine_ctx.scheduler, "kv_cache_manager", None)
     if kv_cache_manager is None:
         kv_cache_manager = getattr(engine_ctx, "kv_cache_manager", None)
+    engine_core = getattr(engine_ctx, "engine_core", None)
+    model_executor = getattr(engine_core, "model_executor", None) if engine_core else None
     
     def alloc_prefix(length: int):
         """Allocate KV cache blocks for the prefix.
@@ -257,55 +260,20 @@ def _allocator_closure(engine_ctx: Any, device_id: int, req: "Request"):
         Returns:
             AllocatedKV dict with k_ptrs and v_ptrs per layer
         """
-        k_ptrs, v_ptrs = [], []
-        
         if kv_cache_manager is None:
             raise RuntimeError("kv_cache_manager not available; cannot allocate prefix")
         
-        block_size = getattr(kv_cache_manager, "block_size", None)
-        if not isinstance(block_size, int) or block_size <= 0:
-            raise RuntimeError(f"invalid kv_cache_manager.block_size={block_size}")
-        # Calculate number of blocks needed
-        
-        num_blocks = (length + block_size - 1) // block_size
-        
-        # Allocate blocks using the cache manager
-        # We allocate a temporary set of blocks for the prefix
-        # The materialize_prefix method will later install these properly
-        from vllm.v1.request import Request as RequestType
-        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-        from vllm.v1.core.kv_cache_utils import KVCacheBlock
-        
-        # Create a temporary request-like object to allocate blocks
-        # In practice, the blocks should be allocated as part of the normal flow
-        # but marked as "pre-allocated" for the prefix region
-        # For now, we return empty pointers - the actual allocation happens
-        # in the scheduler's allocate_slots, and materialize_prefix will
-        # install the imported data
-        
-        # Get layout info using the same getter pattern as _layout_from_ctx
-        cfg = getattr(engine_ctx, "vllm_config", None) or getattr(engine_ctx, "config", None)
-        if cfg is None:
-            raise RuntimeError("[kv-mkt] engine_ctx has no vllm_config/config")
-        
-        mc = getattr(cfg, "model_config", None)
-        if mc is None:
-            raise RuntimeError("[kv-mkt] model_config is None")
-        
-        # Use hf_text_config to get total n_layers (same pattern as _layout_from_ctx)
-        hf_text_config = getattr(mc, "hf_text_config", None)
-        if hf_text_config is None:
-            raise RuntimeError("[kv-mkt] model_config has no hf_text_config")
-        
-        n_layers = getattr(hf_text_config, "num_hidden_layers", None) or getattr(hf_text_config, "n_layers", None)
-        if n_layers is None or n_layers == 0:
-            raise RuntimeError("[kv-mkt] Failed to extract n_layers from hf_text_config")
-        
-        # Initialize empty pointers per layer
-        # The actual pointers will be set by materialize_prefix
-        k_ptrs = [0] * n_layers
-        v_ptrs = [0] * n_layers
-        return {"k_ptrs": k_ptrs, "v_ptrs": v_ptrs, "length": length}
+        try:
+            return kv_cache_manager.reserve_prefix(
+                req, length, model_executor=model_executor
+            )
+        except Exception as exc:
+            _get_logger().warning(
+                f"[kv-mkt] reserve_prefix failed (length={length}): {exc}"
+            )
+            if hasattr(kv_cache_manager, "release_reserved_prefix"):
+                kv_cache_manager.release_reserved_prefix(req)
+            return {"k_ptrs": [], "v_ptrs": [], "length": 0}
     
     return alloc_prefix
 
@@ -490,14 +458,28 @@ def _maybe_import_prefix(
     if not flags or not getattr(flags, "kv_marketplace", False):
         return None
     
+    timings: dict[str, float] = {}
+    hook_start = time.perf_counter()
+    
+    ctx_start = time.perf_counter()
     ctx_dict = make_import_ctx(req, engine_ctx)
+    timings["make_ctx_ms"] = (time.perf_counter() - ctx_start) * 1000.0
     if ctx_dict is None:
+        timings["total_ms"] = (time.perf_counter() - hook_start) * 1000.0
+        _get_logger().info(
+            "kv-marketplace hook timings: make_ctx=%.2f ms plugin=0.00 ms materialize=0.00 ms "
+            "release=0.00 ms total=%.2f ms (skip ctx)",
+            timings["make_ctx_ms"],
+            timings["total_ms"],
+        )
         return None
     
     try:
+        plugin_start = time.perf_counter()
         # Call the plugin's before_prefill function
         result = plugin.before_prefill(ctx_dict)
-        
+        timings["plugin_ms"] = (time.perf_counter() - plugin_start) * 1000.0
+
         if result is not None:
             lcp_len, dst_alloc = result
             
@@ -514,15 +496,64 @@ def _maybe_import_prefix(
                 kv_cache_manager = getattr(engine_ctx.scheduler, "kv_cache_manager", None)
             if kv_cache_manager is None:
                 kv_cache_manager = getattr(engine_ctx, "kv_cache_manager", None)
+            materialize_ms = 0.0
             if kv_cache_manager and hasattr(kv_cache_manager, "materialize_prefix"):
+                mat_start = time.perf_counter()
                 kv_cache_manager.materialize_prefix(req, dst_alloc, lcp_len)
+                materialize_ms = (time.perf_counter() - mat_start) * 1000.0
+            timings["materialize_ms"] = materialize_ms
             
+            timings["total_ms"] = (time.perf_counter() - hook_start) * 1000.0
+            _get_logger().info(
+                "kv-marketplace hook timings: make_ctx=%.2f ms plugin=%.2f ms materialize=%.2f ms "
+                "release=0.00 ms total=%.2f ms (hit)",
+                timings["make_ctx_ms"],
+                timings.get("plugin_ms", 0.0),
+                timings.get("materialize_ms", 0.0),
+                timings["total_ms"],
+            )
             return result
+        # Import failed after reserving blocks; release them for future use.
+        kv_cache_manager = None
+        if hasattr(engine_ctx, "scheduler"):
+            kv_cache_manager = getattr(engine_ctx.scheduler, "kv_cache_manager", None)
+        if kv_cache_manager is None:
+            kv_cache_manager = getattr(engine_ctx, "kv_cache_manager", None)
+        if kv_cache_manager and hasattr(kv_cache_manager, "release_reserved_prefix"):
+            rel_start = time.perf_counter()
+            kv_cache_manager.release_reserved_prefix(req)
+            timings["release_ms"] = (time.perf_counter() - rel_start) * 1000.0
+        timings["total_ms"] = (time.perf_counter() - hook_start) * 1000.0
+        _get_logger().info(
+            "kv-marketplace hook timings: make_ctx=%.2f ms plugin=%.2f ms materialize=0.00 ms "
+            "release=%.2f ms total=%.2f ms (miss)",
+            timings["make_ctx_ms"],
+            timings.get("plugin_ms", 0.0),
+            timings.get("release_ms", 0.0),
+            timings["total_ms"],
+        )
     except Exception as e:
         _get_logger().warning(
             f"kv-marketplace before_prefill failed: {e}"
         )
-    
+        kv_cache_manager = None
+        if hasattr(engine_ctx, "scheduler"):
+            kv_cache_manager = getattr(engine_ctx.scheduler, "kv_cache_manager", None)
+        if kv_cache_manager is None:
+            kv_cache_manager = getattr(engine_ctx, "kv_cache_manager", None)
+        if kv_cache_manager and hasattr(kv_cache_manager, "release_reserved_prefix"):
+            rel_start = time.perf_counter()
+            kv_cache_manager.release_reserved_prefix(req)
+            timings["release_ms"] = (time.perf_counter() - rel_start) * 1000.0
+        timings["total_ms"] = (time.perf_counter() - hook_start) * 1000.0
+        _get_logger().info(
+            "kv-marketplace hook timings: make_ctx=%.2f ms plugin=%.2f ms materialize=0.00 ms "
+            "release=%.2f ms total=%.2f ms (error)",
+            timings["make_ctx_ms"],
+            timings.get("plugin_ms", 0.0),
+            timings.get("release_ms", 0.0),
+            timings["total_ms"],
+        )
     return None
 
 

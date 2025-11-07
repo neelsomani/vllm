@@ -4505,10 +4505,33 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         """
         # Initialize the memory buffer for KV cache
         kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
+        # Keep a reference so other components can inspect layout metadata.
+        self._kv_cache_raw_tensors = kv_cache_raw_tensors
         # Change the memory buffer to the desired shape
         kv_caches = self._reshape_kv_cache_tensors(
             kv_cache_config, kv_cache_raw_tensors
         )
+
+        # Capture per-layer layout metadata (base ptr + page size). This is later
+        # used by kv-marketplace to translate block ids into real device pointers.
+        self._kv_cache_layouts_by_name: dict[str, dict[str, int]] = {}
+        layer_to_spec: dict[str, AttentionSpec | MambaSpec | KVCacheSpec] = {}
+        for group in kv_cache_config.kv_cache_groups:
+            for layer_name in group.layer_names:
+                layer_to_spec[layer_name] = group.kv_cache_spec
+
+        for layer_name, raw_tensor in kv_cache_raw_tensors.items():
+            spec = layer_to_spec.get(layer_name)
+            if spec is None:
+                continue
+            try:
+                page_size_bytes = spec.page_size_bytes
+            except AttributeError:
+                continue
+            self._kv_cache_layouts_by_name[layer_name] = {
+                "base_ptr": raw_tensor.data_ptr(),
+                "page_size_bytes": page_size_bytes,
+            }
 
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
@@ -4524,7 +4547,44 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.kv_caches,
             num_attn_module,
         )
+        # Record the order in which kv caches are bound so we can emit metadata
+        # aligned with runner_kv_caches.
+        try:
+            from vllm.v1.worker.utils import extract_layer_index
+        except ImportError:
+            extract_layer_index = None
+
+        self._kv_cache_layer_order: list[str] = []
+        if extract_layer_index is not None:
+            index2name = defaultdict(list)
+            for layer_name in kv_caches:
+                index = extract_layer_index(layer_name, num_attn_module)
+                index2name[index].append(layer_name)
+            for layer_index in sorted(index2name.keys()):
+                self._kv_cache_layer_order.append(index2name[layer_index][0])
+        else:
+            # Fallback: preserve insertion order of kv_caches dict.
+            self._kv_cache_layer_order = list(kv_caches.keys())
+
         return kv_caches
+
+    def get_kv_cache_layout_metadata(self) -> list[dict[str, int]]:
+        """Expose per-layer kv cache base pointers and page sizes."""
+        if not hasattr(self, "_kv_cache_layouts_by_name"):
+            return []
+        metadata: list[dict[str, int]] = []
+        for layer_name in self._kv_cache_layer_order:
+            layout = self._kv_cache_layouts_by_name.get(layer_name)
+            if not layout:
+                continue
+            metadata.append(
+                {
+                    "layer_name": layer_name,
+                    "base_ptr": layout["base_ptr"],
+                    "page_size_bytes": layout["page_size_bytes"],
+                }
+            )
+        return metadata
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
         self, kv_cache_config: KVCacheConfig

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, overload
@@ -142,6 +143,8 @@ class KVCacheManager:
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.kv_cache_config = kv_cache_config
+        self._attached_model_executor: Any | None = None
+        self._kv_layout_metadata: list[dict[str, int]] | None = None
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
         # via create_kv_cache_blocks instead of creating new ones to avoid GC
@@ -409,20 +412,141 @@ class KVCacheManager:
         """Get the block ids of a request."""
         return self.get_blocks(request_id).get_block_ids()
 
+    def _get_kv_layout_metadata(self, model_executor: Any | None) -> list[dict[str, int]]:
+        if self._kv_layout_metadata:
+            return self._kv_layout_metadata
+        executor = model_executor or self._attached_model_executor
+        if executor is None:
+            return []
+        getter = getattr(executor, "get_kv_cache_layout_metadata", None)
+        if getter is None:
+            return []
+        metadata = getter()
+        if metadata:
+            self._kv_layout_metadata = metadata
+        return metadata or []
+
+    def _build_allocated_kv_dict(
+        self,
+        length: int,
+        metadata: list[dict[str, int]],
+        page_ranges: list[tuple[int, int]] | None,
+    ) -> dict[str, Any]:
+        k_ptrs: list[int] = []
+        v_ptrs: list[int] = []
+        page_ranges_per_layer: list[list[tuple[int, int]]] | None = None
+
+        if page_ranges:
+            page_ranges_per_layer = [list(page_ranges) for _ in metadata]
+
+        for entry in metadata:
+            base_ptr = entry.get("base_ptr")
+            page_size_bytes = entry.get("page_size_bytes")
+            if base_ptr is None or page_size_bytes is None or page_size_bytes <= 0:
+                continue
+            k_ptrs.append(base_ptr)
+            v_ptrs.append(base_ptr + page_size_bytes // 2)
+
+        result = {
+            "k_ptrs": k_ptrs,
+            "v_ptrs": v_ptrs,
+            "length": length,
+        }
+        if page_ranges_per_layer:
+            result["page_ranges"] = page_ranges_per_layer
+        return result
+
+    def attach_model_executor(self, model_executor: Any) -> None:
+        """Attach EngineCore's model executor for layout inspection."""
+        self._attached_model_executor = model_executor
+
+    def reserve_prefix(
+        self,
+        request: Request,
+        length: int,
+        model_executor: Any | None = None,
+    ) -> dict[str, Any]:
+        """Reserve KV pages for an imported prefix and expose device pointers."""
+        if length <= 0:
+            return {"k_ptrs": [], "v_ptrs": [], "length": 0}
+
+        timings: dict[str, float] = {}
+        total_start = time.perf_counter()
+
+        meta_start = time.perf_counter()
+        metadata = self._get_kv_layout_metadata(model_executor)
+        timings["metadata_ms"] = (time.perf_counter() - meta_start) * 1000.0
+        if not metadata:
+            raise RuntimeError(
+                "[kv-mkt] Unable to access KV cache layout metadata; cannot import prefix."
+            )
+
+        num_tokens_need_slot = min(length, self.max_model_len)
+        alloc_start = time.perf_counter()
+        new_blocks = self.coordinator.allocate_new_blocks(
+            request.request_id, num_tokens_need_slot, num_encoder_tokens=0
+        )
+        timings["allocate_blocks_ms"] = (time.perf_counter() - alloc_start) * 1000.0
+        if new_blocks is None:
+            raise RuntimeError("[kv-mkt] Failed to allocate KV cache blocks for prefix.")
+
+        block_ids: list[int] = []
+        if new_blocks:
+            for group in new_blocks:
+                block_ids.extend(block.block_id for block in group)
+        page_ranges = [(block_id, block_id + 1) for block_id in block_ids]
+
+        build_start = time.perf_counter()
+        dst_alloc = self._build_allocated_kv_dict(length, metadata, page_ranges)
+        timings["build_alloc_ms"] = (time.perf_counter() - build_start) * 1000.0
+
+        request._kv_mkt_reserved = {
+            "blocks": new_blocks,
+            "page_ranges": page_ranges,
+            "length": length,
+        }
+
+        total_ms = (time.perf_counter() - total_start) * 1000.0
+        logger.info(
+            "kv-marketplace reserve_prefix timings: metadata=%.2f ms allocate=%.2f ms "
+            "build=%.2f ms total=%.2f ms length=%d blocks=%d",
+            timings.get("metadata_ms", 0.0),
+            timings.get("allocate_blocks_ms", 0.0),
+            timings.get("build_alloc_ms", 0.0),
+            total_ms,
+            length,
+            len(block_ids),
+        )
+        return dst_alloc
+
+    def release_reserved_prefix(self, request: Request) -> None:
+        """Release reserved prefix blocks if import is aborted."""
+        reserved = getattr(request, "_kv_mkt_reserved", None)
+        if not reserved:
+            return
+        self.coordinator.free(request.request_id)
+        setattr(request, "_kv_mkt_reserved", None)
+
     def materialize_prefix(self, request: Request, dst_alloc: dict, lcp_len: int) -> None:
-        """KV Marketplace: Materialize prefix KV cache pages.
-        
-        This is a stub method that should be implemented to actually install
-        the page-table entries/pointers for imported KV cache blocks.
-        
-        Args:
-            request: The request being processed
-            dst_alloc: AllocatedKV dict with k_ptrs and v_ptrs per layer
-            lcp_len: Length of the imported prefix
-        """
-        # TODO: Implement actual page-table installation
-        # This should mark the pages [0:lcp_len] as materialized with the given pointers
-        pass
+        """KV Marketplace: commit reserved blocks after import succeeds."""
+        reserved = getattr(request, "_kv_mkt_reserved", None)
+        if not reserved:
+            return
+        start = time.perf_counter()
+
+        blocks = reserved.get("blocks")
+        if blocks:
+            self.coordinator.save_new_computed_blocks(request.request_id, blocks)
+
+        request.num_computed_tokens = max(request.num_computed_tokens, lcp_len)
+        request.num_cached_tokens = max(request.num_cached_tokens, lcp_len)
+        setattr(request, "_kv_mkt_reserved", None)
+        duration_ms = (time.perf_counter() - start) * 1000.0
+        logger.info(
+            "kv-marketplace: materialize_prefix elapsed %.2f ms (lcp_len=%d)",
+            duration_ms,
+            lcp_len,
+        )
 
     def get_prefill_pages(self, request: Request, engine_ctx: Any = None) -> dict:
         """KV Marketplace: Get KV cache page pointers for prefill region.
@@ -504,83 +628,16 @@ class KVCacheManager:
         
         # Extract block IDs
         block_ids = [block.block_id for block in prefill_blocks]
-        
-        # Convert block IDs to actual GPU memory pointers
-        k_ptrs = []
-        v_ptrs = []
-        
-        if engine_ctx is not None:
-            try:
-                # Get model_executor from engine_ctx (EngineCore)
-                model_executor = getattr(engine_ctx, "model_executor", None)
-                if model_executor is not None:
-                    # Get kv_caches - it's a list of tensors, one per layer
-                    # Each tensor is structured as (2, num_blocks, ...) for K and V
-                    if hasattr(model_executor, "kv_caches"):
-                        kv_caches_list = getattr(model_executor, "kv_caches")
-                        
-                        if isinstance(kv_caches_list, list) and len(kv_caches_list) > 0:
-                            # Get the first layer's KV cache tensor
-                            # For GPT-2, there's one tensor per layer
-                            kv_tensor = kv_caches_list[0]
-                            
-                            if kv_tensor is not None and hasattr(kv_tensor, 'data_ptr'):
-                                base_ptr = kv_tensor.data_ptr()
-                                tensor_shape = kv_tensor.shape
-                                tensor_stride = kv_tensor.stride()
-                                dtype_size = kv_tensor.element_size()
-                                
-                                # Get page_size_bytes from config
-                                page_size_bytes = None
-                                if self.kv_cache_config and len(self.kv_cache_config.kv_cache_groups) > 0:
-                                    first_group = self.kv_cache_config.kv_cache_groups[0]
-                                    page_size_bytes = first_group.kv_cache_spec.page_size_bytes
-                                else:
-                                    # Fallback: estimate from tensor size
-                                    # Total tensor size / number of blocks
-                                    if len(tensor_shape) > 1 and tensor_shape[1] > 0:
-                                        total_bytes = kv_tensor.numel() * dtype_size
-                                        num_blocks = tensor_shape[1]
-                                        page_size_bytes = total_bytes // (num_blocks * 2)  # Divide by 2 for K and V
-                                
-                                if page_size_bytes is not None:
-                                    # Determine K and V layout
-                                    # Most attention backends use (2, num_blocks, ...) where [0] is K and [1] is V
-                                    if len(tensor_shape) > 0 and tensor_shape[0] == 2:
-                                        # Layout is (2, num_blocks, ...) - K at [0], V at [1]
-                                        k_base = base_ptr
-                                        v_base = base_ptr + tensor_stride[0] * dtype_size
-                                        
-                                        # Blocks are in dimension 1
-                                        if len(tensor_stride) > 1:
-                                            block_stride = tensor_stride[1] * dtype_size
-                                        else:
-                                            block_stride = page_size_bytes
-                                        
-                                        for block_id in block_ids:
-                                            k_ptr = k_base + block_id * block_stride
-                                            v_ptr = v_base + block_id * block_stride
-                                            k_ptrs.append(k_ptr)
-                                            v_ptrs.append(v_ptr)
-                                    else:
-                                        # Unknown layout - try using page_size_bytes directly
-                                        for block_id in block_ids:
-                                            block_ptr = base_ptr + block_id * page_size_bytes
-                                            k_ptrs.append(block_ptr)
-                                            v_ptrs.append(block_ptr)
-            except Exception:
-                pass
-        
-        # Fallback to block IDs if pointer extraction failed
-        if not k_ptrs or not v_ptrs:
-            k_ptrs = block_ids.copy()
-            v_ptrs = block_ids.copy()
+        page_ranges = [(block_id, block_id + 1) for block_id in block_ids]
+        metadata = self._get_kv_layout_metadata(getattr(engine_ctx, "model_executor", None))
+        if not metadata:
+            return {
+                "k_ptrs": block_ids.copy(),
+                "v_ptrs": block_ids.copy(),
+                "length": prompt_len,
+            }
 
-        return {
-            "k_ptrs": k_ptrs,
-            "v_ptrs": v_ptrs,
-            "length": prompt_len,
-        }
+        return self._build_allocated_kv_dict(prompt_len, metadata, page_ranges)
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled."""

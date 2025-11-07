@@ -118,6 +118,10 @@ class WorkerBase:
         """Apply a function on the model inside this worker."""
         return fn(self.get_model())
 
+    def get_kv_cache_layout_metadata(self) -> list[dict[str, int]]:
+        """Expose KV cache layout metadata for kv-marketplace integrations."""
+        return []
+
     def load_model(self) -> None:
         """Load model onto target device."""
         raise NotImplementedError

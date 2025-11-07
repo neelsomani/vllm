@@ -110,8 +110,16 @@ class SingleTypeKVCacheManager(ABC):
         if request_id not in self.num_cached_block:
             # A new request.
             req_blocks = self.req_to_blocks[request_id]
-            assert len(req_blocks) == 0
-            req_blocks.extend(new_computed_blocks)
+            if len(req_blocks) == 0:
+                req_blocks.extend(new_computed_blocks)
+            else:
+                # kv-marketplace can reserve blocks before they are committed.
+                # If blocks are already tracked, reuse them instead of asserting.
+                if len(req_blocks) != len(new_computed_blocks) or any(
+                    existing is not new
+                    for existing, new in zip(req_blocks, new_computed_blocks)
+                ):
+                    req_blocks[:] = list(new_computed_blocks)
             self.num_cached_block[request_id] = len(new_computed_blocks)
         else:
             # A running request. Should not have new computed blocks.

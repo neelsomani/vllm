@@ -167,6 +167,12 @@ class Worker(WorkerBase):
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
+    
+    def get_kv_cache_layout_metadata(self) -> list[dict[str, int]]:
+        runner = getattr(self, "model_runner", None)
+        if runner and hasattr(runner, "get_kv_cache_layout_metadata"):
+            return runner.get_kv_cache_layout_metadata()
+        return []
 
     def init_device(self):
         if self.device_config.device.type == "cuda":

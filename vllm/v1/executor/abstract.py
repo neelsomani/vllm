@@ -125,6 +125,17 @@ class Executor(ABC):
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         return self.collective_rpc("get_kv_cache_spec")
 
+    def get_kv_cache_layout_metadata(self) -> list[dict[str, int]]:
+        """Fetch KV cache base pointers/page sizes from the workers."""
+        try:
+            results = self.collective_rpc("get_kv_cache_layout_metadata")
+        except Exception:
+            return []
+        for entry in results:
+            if entry:
+                return entry
+        return []
+
     @overload
     def collective_rpc(
         self,

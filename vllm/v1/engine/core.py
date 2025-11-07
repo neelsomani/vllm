@@ -154,6 +154,11 @@ class EngineCore:
             log_stats=self.log_stats,
             block_size=scheduler_block_size,
         )
+        if hasattr(self.scheduler, "kv_cache_manager"):
+            self.scheduler.kv_cache_manager.attach_model_executor(self.model_executor)
+        # Provide back-reference so hooks inside the scheduler can reach the model
+        # executor without having to plumb it through every call.
+        setattr(self.scheduler, "engine_core", self)
         self.use_spec_decode = vllm_config.speculative_config is not None
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
