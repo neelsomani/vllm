@@ -476,10 +476,31 @@ def _maybe_import_prefix(
     flags = getattr(engine_ctx, "vllm_config", None)
     if flags is None:
         flags = getattr(engine_ctx, "flags", None)
-    
+
     if not flags or not getattr(flags, "kv_marketplace", False):
         return None
-    
+
+    min_prefix = getattr(flags, "kv_min_prefix", 64)
+
+    kv_cache_manager = None
+    if hasattr(engine_ctx, "scheduler"):
+        kv_cache_manager = getattr(engine_ctx.scheduler, "kv_cache_manager", None)
+    if kv_cache_manager is None:
+        kv_cache_manager = getattr(engine_ctx, "kv_cache_manager", None)
+
+    if (
+        kv_cache_manager
+        and hasattr(kv_cache_manager, "peek_prefix_cache_hit_length")
+        and kv_cache_manager.peek_prefix_cache_hit_length(req) >= min_prefix
+    ):
+        _get_logger().debug(
+            "kv-marketplace: skipping import for request %s; "
+            "local prefix cache already has >=%d tokens",
+            req.request_id,
+            min_prefix,
+        )
+        return None
+
     timings: dict[str, float] = {}
     hook_start = time.perf_counter()
     
@@ -513,11 +534,6 @@ def _maybe_import_prefix(
             
             # Inform allocator that prefix pages are materialized
             # Mirror the export lookup: try scheduler first, then direct access
-            kv_cache_manager = None
-            if hasattr(engine_ctx, "scheduler"):
-                kv_cache_manager = getattr(engine_ctx.scheduler, "kv_cache_manager", None)
-            if kv_cache_manager is None:
-                kv_cache_manager = getattr(engine_ctx, "kv_cache_manager", None)
             materialize_ms = 0.0
             if kv_cache_manager and hasattr(kv_cache_manager, "materialize_prefix"):
                 mat_start = time.perf_counter()
@@ -536,11 +552,6 @@ def _maybe_import_prefix(
             )
             return result
         # Import failed after reserving blocks; release them for future use.
-        kv_cache_manager = None
-        if hasattr(engine_ctx, "scheduler"):
-            kv_cache_manager = getattr(engine_ctx.scheduler, "kv_cache_manager", None)
-        if kv_cache_manager is None:
-            kv_cache_manager = getattr(engine_ctx, "kv_cache_manager", None)
         if kv_cache_manager and hasattr(kv_cache_manager, "release_reserved_prefix"):
             rel_start = time.perf_counter()
             kv_cache_manager.release_reserved_prefix(req)

@@ -541,6 +541,13 @@ class KVCacheManager:
         request.num_computed_tokens = max(request.num_computed_tokens, lcp_len)
         request.num_cached_tokens = max(request.num_cached_tokens, lcp_len)
         setattr(request, "_kv_mkt_reserved", None)
+
+        if lcp_len > 0:
+            # Commit imported tokens into the GPU prefix cache so subsequent
+            # requests may hit the native vLLM prefix cache without another
+            # marketplace import/copy.
+            self.cache_blocks(request, lcp_len)
+
         duration_ms = (time.perf_counter() - start) * 1000.0
         logger.info(
             "kv-marketplace: materialize_prefix elapsed %.2f ms (lcp_len=%d)",
@@ -643,6 +650,29 @@ class KVCacheManager:
         """Cache the blocks for the request, if enabled."""
         if self.enable_caching:
             self.coordinator.cache_blocks(request, num_computed_tokens)
+
+    def peek_prefix_cache_hit_length(
+        self, request: Request, max_length: int | None = None
+    ) -> int:
+        """Return how many tokens of this request currently hit the prefix cache.
+
+        Unlike ``get_computed_blocks`` this helper performs a read-only lookup
+        and does not update prefix cache stats. It is useful for external
+        components (e.g., kv-marketplace) that want to know if the native
+        prefix cache already contains a usable prefix without mutating
+        scheduler state.
+        """
+        if not self.enable_caching or request.num_tokens == 0:
+            return 0
+
+        max_cache_hit_length = request.num_tokens - 1
+        if max_length is not None:
+            max_cache_hit_length = min(max_cache_hit_length, max_length)
+
+        _, num_cached_tokens = self.coordinator.find_longest_cache_hit(
+            request.block_hashes, max_cache_hit_length
+        )
+        return num_cached_tokens
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]
