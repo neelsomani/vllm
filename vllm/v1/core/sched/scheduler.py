@@ -448,6 +448,16 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
+                # Built-in prefix caching skips re-compute for up to
+                # `prompt_len - 1` tokens. If we already have those tokens
+                # locally, there is nothing left for the marketplace to import.
+                prompt_len = request.num_prompt_tokens
+                cache_target = max(0, prompt_len - 1)
+                local_hit_covers_prompt = (
+                    request.num_computed_tokens == 0
+                    and cache_target > 0
+                    and num_new_local_computed_tokens >= cache_target
+                )
 
                 encoder_inputs_to_schedule = None
                 new_encoder_compute_budget = encoder_compute_budget
@@ -521,7 +531,12 @@ class Scheduler(SchedulerInterface):
                 # Only run if kv-marketplace is enabled
                 kv_marketplace_enabled = getattr(self.vllm_config, 'kv_marketplace', False)
                 request_waiting = request.status == RequestStatus.WAITING
-                if request_waiting and kv_marketplace_enabled:
+                needs_marketplace_import = (
+                    request_waiting
+                    and kv_marketplace_enabled
+                    and not local_hit_covers_prompt
+                )
+                if needs_marketplace_import:
                     from vllm.kv_marketplace_hooks import _maybe_import_prefix
                     imported = _maybe_import_prefix(request, self)
                     # Note: The hook modifies request.prompt_token_ids and sets req.seq_pos

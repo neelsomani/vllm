@@ -102,7 +102,22 @@ def cuda_platform_plugin() -> str | None:
             logger.debug("Confirmed CUDA platform is available on Jetson.")
             is_cuda = True
         else:
-            logger.debug("CUDA platform is not available because: %s", str(e))
+            # Some environments (e.g., containerized or virtualized setups) have
+            # functional CUDA devices but lack NVML access. Fall back to
+            # torch.cuda.is_available() so we still activate the CUDA platform.
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    logger.warning(
+                        "NVML initialization failed, but torch.cuda.is_available() is "
+                        "True; assuming CUDA platform."
+                    )
+                    is_cuda = True
+                else:
+                    logger.debug("CUDA platform is not available because: %s", str(e))
+            except Exception:
+                logger.debug("CUDA platform is not available because: %s", str(e))
 
     return "vllm.platforms.cuda.CudaPlatform" if is_cuda else None
 
