@@ -530,6 +530,12 @@ class KVCacheManager:
     def materialize_prefix(self, request: Request, dst_alloc: dict, lcp_len: int) -> None:
         """KV Marketplace: commit reserved blocks after import succeeds."""
         reserved = getattr(request, "_kv_mkt_reserved", None)
+        reuse_page_ranges = dst_alloc.get("reuse_page_ranges")
+        if reuse_page_ranges and not reserved:
+            page_ranges = dst_alloc.get("page_ranges")
+            if page_ranges and self._reuse_cached_blocks(request, page_ranges, lcp_len):
+                return
+            # If aliasing failed, fall back to normal path (shouldn't happen).
         if not reserved:
             return
         start = time.perf_counter()
@@ -554,6 +560,63 @@ class KVCacheManager:
             duration_ms,
             lcp_len,
         )
+
+    def _reuse_cached_blocks(
+        self, request: Request, page_ranges: list[list[tuple[int, int]]] | list[tuple[int, int]], lcp_len: int
+    ) -> bool:
+        """Reattach existing cached blocks (zero-copy local reuse)."""
+        if self.num_kv_cache_groups != 1:
+            logger.warning(
+                "kv-marketplace: reuse_cached_blocks currently supports single KV cache group (got %d)",
+                self.num_kv_cache_groups,
+            )
+            return False
+
+        block_ids = self._extract_block_ids_from_page_ranges(page_ranges)
+        if not block_ids:
+            logger.warning("kv-marketplace: reuse_cached_blocks received empty page ranges")
+            return False
+
+        try:
+            blocks = [self.block_pool.blocks[block_id] for block_id in block_ids]
+        except IndexError:
+            logger.warning(
+                "kv-marketplace: reuse_cached_blocks received invalid block id (max=%d)",
+                len(self.block_pool.blocks),
+            )
+            return False
+
+        block_tuple: tuple[list[KVCacheBlock], ...] = (blocks,)
+        self.block_pool.touch(block_tuple)
+        self.coordinator.save_new_computed_blocks(request.request_id, block_tuple)
+        request.num_computed_tokens = max(request.num_computed_tokens, lcp_len)
+        request.num_cached_tokens = max(request.num_cached_tokens, lcp_len)
+
+        logger.info(
+            "kv-marketplace: reused %d cached blocks for request %s (lcp_len=%d)",
+            len(blocks),
+            request.request_id,
+            lcp_len,
+        )
+        return True
+
+    @staticmethod
+    def _extract_block_ids_from_page_ranges(
+        page_ranges: list[list[tuple[int, int]]] | list[tuple[int, int]]
+    ) -> list[int]:
+        """Flatten per-layer page ranges into block ids."""
+        ranges: list[tuple[int, int]]
+        if page_ranges and isinstance(page_ranges[0], list):
+            ranges = page_ranges[0]  # Assume identical ranges per layer.
+        else:
+            ranges = page_ranges  # type: ignore[assignment]
+
+        block_ids: list[int] = []
+        for start, end in ranges:
+            if end <= start:
+                continue
+            block_ids.extend(range(start, end))
+        return block_ids
 
     def get_prefill_pages(self, request: Request, engine_ctx: Any = None) -> dict:
         """KV Marketplace: Get KV cache page pointers for prefill region.
