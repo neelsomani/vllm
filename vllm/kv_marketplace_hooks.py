@@ -516,6 +516,7 @@ def _maybe_import_prefix(
             timings["total_ms"],
         )
         return None
+    tokens = ctx_dict.get("tokens") or getattr(req, "prompt_token_ids", []) or []
     
     try:
         plugin_start = time.perf_counter()
@@ -525,6 +526,11 @@ def _maybe_import_prefix(
 
         if result is not None:
             lcp_len, dst_alloc = result
+            if lcp_len > 0:
+                setattr(req, "_kv_mkt_imported", True)
+                setattr(req, "_kv_mkt_imported_len", lcp_len)
+                orig_len = getattr(req, "_orig_prompt_len", len(tokens))
+                setattr(req, "_kv_mkt_imported_full", lcp_len >= orig_len)
             
             # Update request to skip prefix tokens
             if hasattr(req, "seq_pos"):
@@ -611,12 +617,26 @@ def _export_prefix(
     if not flags or not getattr(flags, "kv_marketplace", False):
         return
     
+    if getattr(req, "_kv_mkt_imported", False) and getattr(
+        req, "_kv_mkt_imported_full", False
+    ):
+        setattr(req, "_kv_mkt_imported", False)
+        setattr(req, "_kv_mkt_imported_full", False)
+        _get_logger().debug(
+            "kv-marketplace: skipping export for imported request %s",
+            req.request_id,
+        )
+        return
+
     ctx_dict = make_export_ctx(req, engine_ctx)
     if ctx_dict is None:
         return
     
     try:
         plugin.after_prefill(ctx_dict)
+        if getattr(req, "_kv_mkt_imported", False):
+            setattr(req, "_kv_mkt_imported", False)
+            setattr(req, "_kv_mkt_imported_full", False)
     except Exception as e:
         _get_logger().warning(
             f"kv-marketplace after_prefill failed: {e}", exc_info=True
