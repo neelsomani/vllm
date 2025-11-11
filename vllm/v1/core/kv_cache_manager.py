@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -638,6 +639,11 @@ class KVCacheManager:
             prompt_len = len(prompt_token_ids) if prompt_token_ids else 0
         
         if prompt_len == 0:
+            if self._export_debug_enabled():
+                logger.info(
+                    "[kv-mkt export dbg] request %s prompt_len=0",
+                    request.request_id,
+                )
             return {
                 "k_ptrs": [],
                 "v_ptrs": [],
@@ -648,6 +654,10 @@ class KVCacheManager:
         request_blocks = self.get_blocks(request.request_id)
         
         if not request_blocks or all(len(group) == 0 for group in request_blocks.blocks):
+            if self._export_debug_enabled():
+                logger.info(
+                    "[kv-mkt export dbg] request %s has no allocated blocks", request.request_id
+                )
             # No blocks allocated yet
             return {
                 "k_ptrs": [],
@@ -679,6 +689,10 @@ class KVCacheManager:
         # Get the first KV cache group's blocks (most models have one group)
         # For multi-group models, we'd need to handle each group separately
         if len(request_blocks.blocks) == 0:
+            if self._export_debug_enabled():
+                logger.info(
+                    "[kv-mkt export dbg] request %s block list empty", request.request_id
+                )
             return {
                 "k_ptrs": [],
                 "v_ptrs": [],
@@ -700,6 +714,15 @@ class KVCacheManager:
         block_ids = [block.block_id for block in prefill_blocks]
         page_ranges = [(block_id, block_id + 1) for block_id in block_ids]
         metadata = self._get_kv_layout_metadata(getattr(engine_ctx, "model_executor", None))
+        if self._export_debug_enabled():
+            logger.info(
+                "[kv-mkt export dbg] req=%s prompt_len=%d block_size=%d prefill_blocks=%d meta_layers=%d",
+                request.request_id,
+                prompt_len,
+                block_size,
+                len(prefill_blocks),
+                len(metadata or []),
+            )
         if not metadata:
             return {
                 "k_ptrs": block_ids.copy(),
@@ -742,3 +765,9 @@ class KVCacheManager:
     ) -> KVCacheBlocks:
         # Only create new KVCacheBlocks for non-empty blocks
         return KVCacheBlocks(blocks) if any(blocks) else self.empty_kv_cache_blocks
+    @staticmethod
+    def _export_debug_enabled() -> bool:
+        val = os.environ.get("KV_MARKETPLACE_EXPORT_DEBUG")
+        if val is None:
+            return False
+        return val.lower() in {"1", "true", "yes", "on"}

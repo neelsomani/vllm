@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Hooks and helpers for kv-marketplace integration."""
 
+import os
 import time
 import torch
 from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
@@ -18,6 +19,20 @@ except ImportError:
     KVCompat = None
 
 logger = None
+
+
+def _export_debug_enabled() -> bool:
+    val = os.environ.get("KV_MARKETPLACE_EXPORT_DEBUG")
+    if val is None:
+        return False
+    return val.lower() in {"1", "true", "yes", "on"}
+
+
+def _debug(msg: str, *args) -> None:
+    if _export_debug_enabled():
+        text = msg % args if args else msg
+        print(f"[kv-mkt export dbg] {text}", flush=True)
+        _get_logger().info(text)
 
 
 def _get_logger():
@@ -432,14 +447,30 @@ def make_export_ctx(
         elif hasattr(engine_ctx, "kv_cache_manager"):
             # Fallback: try direct access (in case it's a scheduler)
             kv_cache_manager = engine_ctx.kv_cache_manager
-        
+
         if kv_cache_manager and hasattr(kv_cache_manager, "get_prefill_pages"):
             # Pass engine_ctx (EngineCore) so we can access model_executor for KV cache tensors
             kv_pages = kv_cache_manager.get_prefill_pages(req, engine_ctx=engine_ctx)
-        
+        else:
+            _debug(
+                "no kv_cache_manager or get_prefill_pages missing for req=%s",
+                getattr(req, "request_id", "unknown"),
+            )
+
         # Ensure we use the correct length
         length = kv_pages.get("length", prompt_len)
-        
+
+        _debug(
+            "ctx req=%s prompt_len=%d orig_len=%s export_len=%d k_ptrs=%d v_ptrs=%d page_ranges=%s", 
+            getattr(req, "request_id", "unknown"),
+            prompt_len,
+            orig_len,
+            length,
+            len(kv_pages.get("k_ptrs", []) or []),
+            len(kv_pages.get("v_ptrs", []) or []),
+            bool(kv_pages.get("page_ranges")),
+        )
+
         return {
             "device_id": device_id,
             "compat": compat,
@@ -630,13 +661,27 @@ def _export_prefix(
 
     ctx_dict = make_export_ctx(req, engine_ctx)
     if ctx_dict is None:
+        _debug(
+            "ctx generation failed for req=%s",
+            getattr(req, "request_id", "unknown"),
+        )
         return
     
     try:
+        _debug(
+            "calling after_prefill req=%s len=%s k_ptrs=%d",
+            getattr(req, "request_id", "unknown"),
+            ctx_dict.get("length"),
+            len(ctx_dict.get("kv_pages", {}).get("k_ptrs", []) or []),
+        )
         plugin.after_prefill(ctx_dict)
         if getattr(req, "_kv_mkt_imported", False):
             setattr(req, "_kv_mkt_imported", False)
             setattr(req, "_kv_mkt_imported_full", False)
+        _debug(
+            "after_prefill finished req=%s",
+            getattr(req, "request_id", "unknown"),
+        )
     except Exception as e:
         _get_logger().warning(
             f"kv-marketplace after_prefill failed: {e}", exc_info=True
