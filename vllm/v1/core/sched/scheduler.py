@@ -538,7 +538,15 @@ class Scheduler(SchedulerInterface):
                 )
                 if needs_marketplace_import:
                     from vllm.kv_marketplace_hooks import _maybe_import_prefix
+                    print(
+                        f"[kv-mkt dbg] scheduler: invoking _maybe_import_prefix req={request.request_id}",
+                        flush=True,
+                    )
                     imported = _maybe_import_prefix(request, self)
+                    print(
+                        f"[kv-mkt dbg] scheduler: _maybe_import_prefix returned {bool(imported)} for req={request.request_id}",
+                        flush=True,
+                    )
                     # Note: The hook modifies request.prompt_token_ids and sets req.seq_pos
                     # The allocator is informed via materialize_prefix in the hook function
 
@@ -1025,6 +1033,22 @@ class Scheduler(SchedulerInterface):
                 stopped = check_stop(request, self.max_model_len, pooler_output)
 
             if stopped:
+                if getattr(self.vllm_config, "kv_marketplace", False):
+                    try:
+                        from vllm.kv_marketplace_hooks import _export_prefix
+
+                        prompt_len = getattr(request, "num_prompt_tokens", None)
+                        if prompt_len is None:
+                            prompt_tokens = getattr(request, "prompt_token_ids", []) or []
+                            prompt_len = len(prompt_tokens)
+
+                        if prompt_len > 0 and request.num_computed_tokens >= prompt_len:
+                            _export_prefix(request, self)
+                    except Exception:
+                        logger.exception(
+                            "kv-marketplace export failed for %s", request.request_id
+                        )
+
                 kv_transfer_params = self._free_request(request)
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)

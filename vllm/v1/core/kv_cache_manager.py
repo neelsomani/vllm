@@ -18,6 +18,11 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 
+def _dbg(msg: str, *args) -> None:
+    text = msg % args if args else msg
+    print(f"[kv-mkt export dbg] {text}")
+
+
 @dataclass
 class KVCacheBlocks:
     """
@@ -92,6 +97,15 @@ class KVCacheBlocks:
 
 
 class KVCacheManager:
+    @staticmethod
+    def _export_debug_enabled() -> bool:
+        return True
+
+    @classmethod
+    def _dbg(cls, msg: str, *args) -> None:
+        if cls._export_debug_enabled():
+            text = msg % args if args else msg
+            print(f"[kv-mkt export dbg] {text}", flush=True)
     def __init__(
         self,
         kv_cache_config: KVCacheConfig,
@@ -636,8 +650,10 @@ class KVCacheManager:
         if prompt_len is None:
             prompt_token_ids = getattr(request, "prompt_token_ids", [])
             prompt_len = len(prompt_token_ids) if prompt_token_ids else 0
-        
+        self._dbg("get_prefill_pages: req=%s prompt_len=%d", request.request_id, prompt_len)
+
         if prompt_len == 0:
+            self._dbg("get_prefill_pages: prompt_len=0 -> returning empty for req=%s", request.request_id)
             return {
                 "k_ptrs": [],
                 "v_ptrs": [],
@@ -646,8 +662,14 @@ class KVCacheManager:
         
         # Get the blocks allocated for this request
         request_blocks = self.get_blocks(request.request_id)
-        
+        self._dbg(
+            "get_prefill_pages: req=%s has_blocks=%s",
+            request.request_id,
+            bool(request_blocks and any(len(group) for group in request_blocks.blocks)),
+        )
+
         if not request_blocks or all(len(group) == 0 for group in request_blocks.blocks):
+            self._dbg("get_prefill_pages: no blocks yet for req=%s", request.request_id)
             # No blocks allocated yet
             return {
                 "k_ptrs": [],
@@ -667,6 +689,12 @@ class KVCacheManager:
                 block_size = 16
         
         num_blocks_for_prefill = (prompt_len + block_size - 1) // block_size  # Ceiling division
+        self._dbg(
+            "get_prefill_pages: req=%s block_size=%d num_blocks_for_prefill=%d",
+            request.request_id,
+            block_size,
+            num_blocks_for_prefill,
+        )
         
         # Get block IDs for the prefill region (first num_blocks_for_prefill blocks)
         # NOTE: We return block IDs as placeholder pointers. The actual pointer calculation
@@ -679,6 +707,7 @@ class KVCacheManager:
         # Get the first KV cache group's blocks (most models have one group)
         # For multi-group models, we'd need to handle each group separately
         if len(request_blocks.blocks) == 0:
+            self._dbg("get_prefill_pages: request_blocks.blocks empty for req=%s", request.request_id)
             return {
                 "k_ptrs": [],
                 "v_ptrs": [],
@@ -690,6 +719,7 @@ class KVCacheManager:
         prefill_blocks = block_group[:num_blocks_for_prefill]
         
         if not prefill_blocks:
+            self._dbg("get_prefill_pages: prefill_blocks empty for req=%s", request.request_id)
             return {
                 "k_ptrs": [],
                 "v_ptrs": [],
@@ -700,7 +730,14 @@ class KVCacheManager:
         block_ids = [block.block_id for block in prefill_blocks]
         page_ranges = [(block_id, block_id + 1) for block_id in block_ids]
         metadata = self._get_kv_layout_metadata(getattr(engine_ctx, "model_executor", None))
+        self._dbg(
+            "get_prefill_pages: req=%s metadata_layers=%d block_ids=%d",
+            request.request_id,
+            len(metadata or []),
+            len(block_ids),
+        )
         if not metadata:
+            self._dbg("get_prefill_pages: metadata empty, returning block_ids for req=%s", request.request_id)
             return {
                 "k_ptrs": block_ids.copy(),
                 "v_ptrs": block_ids.copy(),
@@ -708,6 +745,21 @@ class KVCacheManager:
             }
 
         return self._build_allocated_kv_dict(prompt_len, metadata, page_ranges)
+
+    def debug_request_blocks(
+        self, request_id: str, limit: int = 10
+    ) -> list[tuple[int, int]]:
+        """Return up to ``limit`` block ids per group for debugging."""
+        request_blocks = self.get_blocks(request_id)
+        preview: list[tuple[int, int]] = []
+        if not request_blocks:
+            return preview
+        for group_idx, group in enumerate(request_blocks.blocks):
+            for block in group:
+                preview.append((group_idx, getattr(block, "block_id", -1)))
+                if len(preview) >= limit:
+                    return preview
+        return preview
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled."""
