@@ -538,15 +538,7 @@ class Scheduler(SchedulerInterface):
                 )
                 if needs_marketplace_import:
                     from vllm.kv_marketplace_hooks import _maybe_import_prefix
-                    print(
-                        f"[kv-mkt dbg] scheduler: invoking _maybe_import_prefix req={request.request_id}",
-                        flush=True,
-                    )
                     imported = _maybe_import_prefix(request, self)
-                    print(
-                        f"[kv-mkt dbg] scheduler: _maybe_import_prefix returned {bool(imported)} for req={request.request_id}",
-                        flush=True,
-                    )
                     # Note: The hook modifies request.prompt_token_ids and sets req.seq_pos
                     # The allocator is informed via materialize_prefix in the hook function
 

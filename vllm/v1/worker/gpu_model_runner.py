@@ -1084,24 +1084,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
         # arange: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
-        probe_requests: list[dict[str, Any]] = []
-        if num_reqs:
-            for idx, req_id in enumerate(self.input_batch.req_ids):
-                req = self.requests[req_id]
-                if getattr(req, "_kv_mkt_debug_probe", False):
-                    start = 0 if idx == 0 else cu_num_tokens[idx - 1]
-                    end = cu_num_tokens[idx]
-                    probe_requests.append(
-                        {
-                            "req": req,
-                            "req_id": req_id,
-                            "idx": idx,
-                            "start": int(start),
-                            "end": int(end),
-                            "lcp_len": getattr(req, "_kv_mkt_debug_lcp_len", None),
-                        }
-                    )
-                    setattr(req, "_kv_mkt_debug_probe", False)
 
         # Get positions.
         positions_np = self.positions.np[:total_num_scheduled_tokens]
@@ -1110,14 +1092,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             arange,
             out=positions_np,
         )
-        if probe_requests:
-            for probe in probe_requests:
-                start = probe["start"]
-                end = probe["end"]
-                if end > start:
-                    probe["positions"] = positions_np[start:end].astype(int).tolist()
-                else:
-                    probe["positions"] = []
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1230,42 +1204,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.seq_lens.np[num_reqs:].fill(0)
         self.seq_lens.copy_to_gpu()
         seq_lens = self.seq_lens.gpu[:num_reqs]
-        if probe_requests:
-            rope_cfg = getattr(self.model_config, "hf_config", None)
-            rope_base = None
-            rope_scale = None
-            if rope_cfg is not None:
-                rope_base = getattr(rope_cfg, "rope_theta", None) or getattr(
-                    rope_cfg, "rope_base", None
-                )
-                rope_scale = getattr(rope_cfg, "rope_scaling", None)
-            for probe in probe_requests:
-                req = probe["req"]
-                idx = probe["idx"]
-                seq_len_val = int(self.seq_lens.np[idx])
-                orig_len = getattr(req, "_orig_prompt_len", None)
-                if orig_len is None:
-                    prompt_tokens = getattr(req, "prompt_token_ids", []) or []
-                    orig_len = len(prompt_tokens)
-                positions_preview = probe.get("positions", [])[:16]
-                print(
-                    "[ROPE] req=%s lcp_len=%s prefill_len=%s num_cached_tokens=%s "
-                    "num_computed_tokens=%s seq_pos=%s"
-                    % (
-                        getattr(req, "request_id", "unknown"),
-                        probe.get("lcp_len"),
-                        orig_len,
-                        getattr(req, "num_cached_tokens", None),
-                        getattr(req, "num_computed_tokens", None),
-                        getattr(req, "seq_pos", None),
-                    ),
-                    flush=True,
-                )
-                print(
-                    "[ROPE] attn seq_len=%s position_ids[:16]=%s rope_base/scale=%s %s"
-                    % (seq_len_val, positions_preview, rope_base, rope_scale),
-                    flush=True,
-                )
         max_seq_len = self.seq_lens.np[:num_reqs].max().item()
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]

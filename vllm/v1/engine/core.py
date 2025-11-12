@@ -323,7 +323,7 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
-        print("kv-marketplace IN THE STEP FUNCTION")
+        logger.debug("kv-marketplace: EngineCore.step invoked")
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
@@ -337,7 +337,7 @@ class EngineCore:
             pre_update_requests = {
                 req.request_id: req for req in self.scheduler.requests.values()
             }
-            print(f"kv-marketplace GOT PRE-UPDATE REQUESTS: {pre_update_requests}")
+            logger.debug("kv-marketplace: captured %d pre-update requests", len(pre_update_requests))
 
         with self.log_error_detail(scheduler_output):
             model_output = self.model_executor.execute_model(scheduler_output)
@@ -347,7 +347,7 @@ class EngineCore:
         )
 
         if kv_marketplace_enabled:
-            print("kv-marketplace CALLING MAYBE EXPORT KV PREFIXES")
+            logger.debug("kv-marketplace: exporting KV prefixes (step)")
             self._maybe_export_kv_prefixes(scheduler_output, pre_update_requests)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -430,10 +430,9 @@ class EngineCore:
         pre_update_requests: dict[str, Request] | None,
     ) -> None:
         from vllm.kv_marketplace_hooks import _export_prefix
-        print(
-            "kv-marketplace WE ARE INSIDE MAYBE EXPORT KV PREFIXES "
-            f"(finished_ids={getattr(scheduler_output, 'finished_req_ids', set())})",
-            flush=True,
+        logger.debug(
+            "kv-marketplace: evaluating exports (finished_ids=%s)",
+            getattr(scheduler_output, "finished_req_ids", set()),
         )
         requests_to_check: dict[str, Request] = {
             req.request_id: req for req in self.scheduler.requests.values()
@@ -456,22 +455,23 @@ class EngineCore:
                     origin_map[req_id] = "snapshot"
 
         if not requests_to_check:
-            print("[kv-mkt dbg] engine_core: no requests to evaluate for export", flush=True)
+            logger.debug("kv-marketplace: no requests to evaluate for export")
             return
 
-        print(
-            "kv-marketplace REQUESTS TO CHECK: "
-            + ", ".join(f"{rid}({origin_map.get(rid,'?')})" for rid in requests_to_check),
-            flush=True,
+        logger.debug(
+            "kv-marketplace: requests to check = %s",
+            ", ".join(f"{rid}({origin_map.get(rid,'?')})" for rid in requests_to_check),
         )
         for req_id, request in requests_to_check.items():
             already_exported = getattr(request, "_kv_marketplace_exported", False)
             num_computed = getattr(request, "num_computed_tokens", 0)
             if already_exported or num_computed <= 0:
                 reason = "already_exported" if already_exported else "no_tokens"
-                print(
-                    f"[kv-mkt dbg] engine_core: skipping req={req_id} origin={origin_map.get(req_id, 'unknown')} reason={reason}",
-                    flush=True,
+                logger.debug(
+                    "kv-marketplace: skipping req=%s origin=%s reason=%s",
+                    req_id,
+                    origin_map.get(req_id, "unknown"),
+                    reason,
                 )
                 continue
 
@@ -479,22 +479,30 @@ class EngineCore:
             orig_len = getattr(request, "_orig_prompt_len", None)
             if orig_len is None:
                 orig_len = len(prompt_token_ids) if prompt_token_ids else 0
-                print(
-                    f"[kv-mkt dbg] engine_core: req={req_id} origin={origin_map.get(req_id, 'unknown')} missing _orig_prompt_len, fallback={orig_len}",
-                    flush=True,
+                logger.debug(
+                    "kv-marketplace: req=%s origin=%s missing _orig_prompt_len, fallback=%s",
+                    req_id,
+                    origin_map.get(req_id, "unknown"),
+                    orig_len,
                 )
 
             if orig_len > 0 and num_computed >= orig_len:
-                print(
-                    f"[kv-mkt dbg] engine_core: exporting req={request.request_id} origin={origin_map.get(req_id, 'unknown')} orig_len={orig_len} num_computed={num_computed}",
-                    flush=True,
+                logger.debug(
+                    "kv-marketplace: exporting req=%s origin=%s orig_len=%s num_computed=%s",
+                    request.request_id,
+                    origin_map.get(req_id, "unknown"),
+                    orig_len,
+                    num_computed,
                 )
                 _export_prefix(request, self)
                 request._kv_marketplace_exported = True
             else:
-                print(
-                    f"[kv-mkt dbg] engine_core: insufficient tokens req={request.request_id} origin={origin_map.get(req_id, 'unknown')} num_computed={num_computed} orig_len={orig_len}",
-                    flush=True,
+                logger.debug(
+                    "kv-marketplace: insufficient tokens req=%s origin=%s num_computed=%s orig_len=%s",
+                    request.request_id,
+                    origin_map.get(req_id, "unknown"),
+                    num_computed,
+                    orig_len,
                 )
 
     def shutdown(self):

@@ -8,8 +8,6 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
 
 from vllm.kv_marketplace_shim import load_plugin
 
-print(f"kv-mkt hooks module path: {__file__}", flush=True)
-
 if TYPE_CHECKING:
     from vllm.v1.request import Request
     from vllm.config import VllmConfig
@@ -20,7 +18,6 @@ except ImportError:
     KVCompat = None
 
 logger = None
-_PRINTED_HEAD_INFO = False
 
 
 def _get_logger():
@@ -32,8 +29,9 @@ def _get_logger():
 
 
 def _dbg(msg: str, *args):
+    logger = _get_logger()
     text = msg % args if args else msg
-    print(f"[kv-mkt dbg] {text}")
+    logger.debug(text)
 
 
 def _device_id_from_ctx(engine_ctx: Any) -> int:
@@ -352,9 +350,9 @@ def make_import_ctx(
     if not plugin:
         return None
     
-    print(
-        f"kv-mkt make_import_ctx: entered req={getattr(req, 'request_id', 'unknown')}",
-        flush=True,
+    _dbg(
+        "kv-mkt make_import_ctx: entered req=%s",
+        getattr(req, "request_id", "unknown"),
     )
     try:
         flags = getattr(engine_ctx, "vllm_config", None) or getattr(engine_ctx, "flags", None)
@@ -399,7 +397,7 @@ def make_import_ctx(
             getattr(req, "request_id", "unknown"),
             e,
         )
-        traceback.print_exc()
+        _get_logger().exception("kv-marketplace make_import_ctx failed")
         return None
 
 
@@ -416,10 +414,10 @@ def make_export_ctx(
     Returns:
         Context dict for after_prefill, or None if context cannot be built
     """
-    print("kv-mkt make_export_ctx: entered", flush=True)
+    _dbg("kv-mkt make_export_ctx: entered")
     plugin = load_plugin()
     if not plugin:
-        print("kv-mkt make_export_ctx: plugin missing", flush=True)
+        _dbg("kv-mkt make_export_ctx: plugin missing")
         return None
     
     try:
@@ -427,9 +425,8 @@ def make_export_ctx(
         req_id = getattr(req, "request_id", "unknown")
         if not flags:
             _dbg("make_export_ctx: missing flags for req=%s", req_id)
-            print(f"kv-mkt make_export_ctx: missing flags req={req_id}", flush=True)
             return None
-        print(f"kv-mkt make_export_ctx: start req={req_id}", flush=True)
+        _dbg(f"kv-mkt make_export_ctx: start req={req_id}")
         _dbg(
             "make_export_ctx: req=%s kv_min_prefix=%s",
             req_id,
@@ -438,8 +435,7 @@ def make_export_ctx(
         
         device_id = _device_id_from_ctx(engine_ctx)
         
-        print(f"kv-mkt make_export_ctx: determining tokens req={req_id}", flush=True)
-        print(f"kv-mkt make_export_ctx: determining tokens req={req_id}", flush=True)
+        _dbg(f"kv-mkt make_export_ctx: determining tokens req={req_id}")
         # Use original prompt tokens and length for export (before they were sliced)
         orig_tokens = getattr(req, "_orig_prompt_token_ids", None)
         orig_len = getattr(req, "_orig_prompt_len", None)
@@ -460,18 +456,20 @@ def make_export_ctx(
             orig_len,
             len(tokens),
         )
-        print(
-            f"kv-mkt make_export_ctx: after tokens req={req_id} prompt_len={prompt_len} orig_len={orig_len}",
-            flush=True,
+        _dbg(
+            "kv-mkt make_export_ctx: after tokens req=%s prompt_len=%s orig_len=%s",
+            req_id,
+            prompt_len,
+            orig_len,
         )
         
-        print(f"kv-mkt make_export_ctx: fetching compat/layout req={req_id}", flush=True)
+        _dbg(f"kv-mkt make_export_ctx: fetching compat/layout req={req_id}")
         compat, layout, _ = _get_cached_engine_ctx_data(engine_ctx, device_id)
-        print(f"kv-mkt make_export_ctx: have compat/layout req={req_id}", flush=True)
+        _dbg(f"kv-mkt make_export_ctx: have compat/layout req={req_id}")
 
         # Pull the pages/pointers the allocator just filled during prefill
         kv_pages = {"k_ptrs": [], "v_ptrs": [], "length": prompt_len}
-        print(f"kv-mkt make_export_ctx: initial kv_pages empty req={req_id}", flush=True)
+        _dbg(f"kv-mkt make_export_ctx: initial kv_pages empty req={req_id}")
         
         # Try to get actual KV cache pointers if available
         # kv_cache_manager is in scheduler, not directly in EngineCore
@@ -481,27 +479,27 @@ def make_export_ctx(
         elif hasattr(engine_ctx, "kv_cache_manager"):
             # Fallback: try direct access (in case it's a scheduler)
             kv_cache_manager = engine_ctx.kv_cache_manager
-        print(
-            f"kv-mkt make_export_ctx: kv_cache_manager={'yes' if kv_cache_manager else 'no'} req={req_id}",
-            flush=True,
+        _dbg(
+            "kv-mkt make_export_ctx: kv_cache_manager=%s req=%s",
+            "yes" if kv_cache_manager else "no",
+            req_id,
         )
         
         if kv_cache_manager and hasattr(kv_cache_manager, "get_prefill_pages"):
             # Pass engine_ctx (EngineCore) so we can access model_executor for KV cache tensors
             kv_pages = kv_cache_manager.get_prefill_pages(req, engine_ctx=engine_ctx)
-            print(
-                f"kv-mkt make_export_ctx: got prefill pages req={req_id} k_ptrs={len(kv_pages.get('k_ptrs', []) or [])} v_ptrs={len(kv_pages.get('v_ptrs', []) or [])}",
-                flush=True,
+            _dbg(
+                "kv-mkt make_export_ctx: got prefill pages req=%s k_ptrs=%d v_ptrs=%d",
+                req_id,
+                len(kv_pages.get("k_ptrs", []) or []),
+                len(kv_pages.get("v_ptrs", []) or []),
             )
         else:
             _dbg(
                 "make_export_ctx: kv_cache_manager missing or lacks get_prefill_pages for req=%s",
                 req_id,
             )
-            print(
-                f"kv-mkt make_export_ctx: missing get_prefill_pages req={req_id}",
-                flush=True,
-            )
+            _dbg(f"kv-mkt make_export_ctx: missing get_prefill_pages req={req_id}")
 
         # Ensure we use the correct length
         length = kv_pages.get("length", prompt_len)
@@ -514,9 +512,12 @@ def make_export_ctx(
             len(kv_pages.get("v_ptrs", []) or []),
             bool(kv_pages.get("page_ranges")),
         )
-        print(
-            f"kv-mkt make_export_ctx: final ctx req={req_id} length={length} k_ptrs={len(kv_pages.get('k_ptrs', []) or [])} v_ptrs={len(kv_pages.get('v_ptrs', []) or [])}",
-            flush=True,
+        _dbg(
+            "kv-mkt make_export_ctx: final ctx req=%s length=%s k_ptrs=%d v_ptrs=%d",
+            req_id,
+            length,
+            len(kv_pages.get("k_ptrs", []) or []),
+            len(kv_pages.get("v_ptrs", []) or []),
         )
 
         return {
@@ -529,15 +530,11 @@ def make_export_ctx(
         }
     except Exception as e:
         _dbg(
-            "make_export_ctx: exception for req=%s -> %s",
+            "kv-mkt make_export_ctx: exception req=%s -> %s",
             getattr(req, "request_id", "unknown"),
             e,
         )
-        print(
-            f"kv-mkt make_export_ctx: exception req={getattr(req, 'request_id', 'unknown')} -> {e}",
-            flush=True,
-        )
-        traceback.print_exc()
+        _get_logger().exception("kv-marketplace make_export_ctx failed")
         return None
 
 
@@ -558,9 +555,9 @@ def _maybe_import_prefix(
     if not plugin:
         return None
     
-    print(
-        f"kv-mkt _maybe_import_prefix: start req={getattr(req, 'request_id', 'unknown')}",
-        flush=True,
+    _dbg(
+        "kv-mkt _maybe_import_prefix: start req=%s",
+        getattr(req, "request_id", "unknown"),
     )
     
     # Check if kv-marketplace is enabled
@@ -617,44 +614,16 @@ def _maybe_import_prefix(
 
         if result is not None:
             lcp_len, dst_alloc = result
-            print(
-                f"kv-mkt _maybe_import_prefix: HIT req={getattr(req, 'request_id', 'unknown')} lcp_len={lcp_len}",
-                flush=True,
+            _dbg(
+                "kv-mkt _maybe_import_prefix: HIT req=%s lcp_len=%s",
+                getattr(req, "request_id", "unknown"),
+                lcp_len,
             )
-            global _PRINTED_HEAD_INFO
-            if not _PRINTED_HEAD_INFO:
-                model_cfg = getattr(flags, "model_config", None)
-                if model_cfg is not None:
-                    try:
-                        total_q = model_cfg.get_total_num_attention_heads()
-                    except Exception:
-                        total_q = getattr(
-                            getattr(model_cfg, "hf_config", None),
-                            "num_attention_heads",
-                            None,
-                        )
-                    try:
-                        total_kv = model_cfg.get_total_num_kv_heads()
-                    except Exception:
-                        total_kv = getattr(
-                            getattr(model_cfg, "hf_config", None),
-                            "num_key_value_heads",
-                            total_q,
-                        )
-                    if total_q and total_kv:
-                        ratio = total_q // max(total_kv, 1)
-                        print(
-                            f"[HEADS] n_q_heads={total_q} n_kv_heads={total_kv} ratio={ratio}",
-                            flush=True,
-                        )
-                        _PRINTED_HEAD_INFO = True
             if lcp_len > 0:
                 setattr(req, "_kv_mkt_imported", True)
                 setattr(req, "_kv_mkt_imported_len", lcp_len)
                 orig_len = getattr(req, "_orig_prompt_len", len(tokens))
                 setattr(req, "_kv_mkt_imported_full", lcp_len >= orig_len)
-                setattr(req, "_kv_mkt_debug_probe", True)
-                setattr(req, "_kv_mkt_debug_lcp_len", lcp_len)
             
             # Update request counters so scheduler/runner know prefix is satisfied.
             if hasattr(req, "seq_pos"):
@@ -663,37 +632,13 @@ def _maybe_import_prefix(
                 req.num_cached_tokens = lcp_len
             if hasattr(req, "num_computed_tokens"):
                 req.num_computed_tokens = lcp_len
-            
-            page_ranges = dst_alloc.get("page_ranges") if isinstance(dst_alloc, dict) else None
-            if page_ranges:
-                flat_ranges = page_ranges
-                if isinstance(page_ranges, list) and page_ranges and isinstance(page_ranges[0], list):
-                    flat_ranges = page_ranges[0]
-                preview = flat_ranges[:10]
-                print(
-                    f"[PAGES] dst first 10: {preview} total={len(flat_ranges)}",
-                    flush=True,
-                )
-            
+
             # Inform allocator that prefix pages are materialized
             # Mirror the export lookup: try scheduler first, then direct access
             materialize_ms = 0.0
             if kv_cache_manager and hasattr(kv_cache_manager, "materialize_prefix"):
                 mat_start = time.perf_counter()
                 kv_cache_manager.materialize_prefix(req, dst_alloc, lcp_len)
-                debug_blocks = []
-                if hasattr(kv_cache_manager, "debug_request_blocks"):
-                    try:
-                        debug_blocks = kv_cache_manager.debug_request_blocks(
-                            req.request_id, limit=10
-                        )
-                    except Exception:
-                        debug_blocks = []
-                if debug_blocks:
-                    print(
-                        f"[PAGES] allocator blocks first 10: {debug_blocks}",
-                        flush=True,
-                    )
                 materialize_ms = (time.perf_counter() - mat_start) * 1000.0
             timings["materialize_ms"] = materialize_ms
             
@@ -721,9 +666,9 @@ def _maybe_import_prefix(
             timings.get("release_ms", 0.0),
             timings["total_ms"],
         )
-        print(
-            f"kv-mkt _maybe_import_prefix: MISS req={getattr(req, 'request_id', 'unknown')}",
-            flush=True,
+        _dbg(
+            "kv-mkt _maybe_import_prefix: MISS req=%s",
+            getattr(req, "request_id", "unknown"),
         )
     except Exception as e:
         _get_logger().warning(
@@ -760,18 +705,14 @@ def _export_prefix(
         req: The request that just completed prefill
         engine_ctx: Engine context (scheduler or EngineCore)
     """
-    print(
-        f"kv-mkt _export_prefix: invoked req={getattr(req, 'request_id', 'unknown')}",
-        flush=True,
+    _dbg(
+        "kv-mkt _export_prefix: invoked req=%s",
+        getattr(req, "request_id", "unknown"),
     )
 
     plugin = load_plugin()
     if not plugin:
         _dbg("kv-marketplace: PLUGIN NOT LOADED")
-        print(
-            f"kv-mkt _export_prefix: plugin unavailable req={getattr(req, 'request_id', 'unknown')}",
-            flush=True,
-        )
         return
     
     flags = getattr(engine_ctx, "vllm_config", None)
@@ -780,10 +721,6 @@ def _export_prefix(
     
     if not flags or not getattr(flags, "kv_marketplace", False):
         _dbg("KV_MARKETPLACE FLAG IS FALSE, EXITING EXPORT")
-        print(
-            f"kv-mkt _export_prefix: disabled via flag req={getattr(req, 'request_id', 'unknown')}",
-            flush=True,
-        )
         return
     
     if getattr(req, "_kv_mkt_imported", False) and getattr(
@@ -795,19 +732,11 @@ def _export_prefix(
             "kv-marketplace: skipping export for imported request %s",
             req.request_id,
         )
-        print(
-            f"kv-mkt _export_prefix: skipping imported req={getattr(req, 'request_id', 'unknown')}",
-            flush=True,
-        )
         return
 
     ctx_dict = make_export_ctx(req, engine_ctx)
     if ctx_dict is None:
         _dbg("_export_prefix: ctx_dict is None for req=%s", getattr(req, "request_id", "unknown"))
-        print(
-            f"kv-mkt _export_prefix: make_export_ctx returned None req={getattr(req, 'request_id', 'unknown')}",
-            flush=True,
-        )
         return
     
     try:
@@ -818,9 +747,9 @@ def _export_prefix(
             len(ctx_dict.get("kv_pages", {}).get("k_ptrs", []) or []),
         )
         plugin.after_prefill(ctx_dict)
-        print(
-            f"kv-mkt _export_prefix: after_prefill success req={getattr(req, 'request_id', 'unknown')}",
-            flush=True,
+        _dbg(
+            "kv-mkt _export_prefix: after_prefill success req=%s",
+            getattr(req, "request_id", "unknown"),
         )
         _dbg(
             "_export_prefix: after_prefill completed req=%s",
@@ -838,4 +767,4 @@ def _export_prefix(
             getattr(req, "request_id", "unknown"),
             e,
         )
-        traceback.print_exc()
+        _get_logger().exception("kv-marketplace _export_prefix after_prefill failed")

@@ -99,7 +99,7 @@ class KVCacheBlocks:
 class KVCacheManager:
     @staticmethod
     def _export_debug_enabled() -> bool:
-        return True
+        return False
 
     @classmethod
     def _dbg(cls, msg: str, *args) -> None:
@@ -745,21 +745,6 @@ class KVCacheManager:
             }
 
         return self._build_allocated_kv_dict(prompt_len, metadata, page_ranges)
-
-    def debug_request_blocks(
-        self, request_id: str, limit: int = 10
-    ) -> list[tuple[int, int]]:
-        """Return up to ``limit`` block ids per group for debugging."""
-        request_blocks = self.get_blocks(request_id)
-        preview: list[tuple[int, int]] = []
-        if not request_blocks:
-            return preview
-        for group_idx, group in enumerate(request_blocks.blocks):
-            for block in group:
-                preview.append((group_idx, getattr(block, "block_id", -1)))
-                if len(preview) >= limit:
-                    return preview
-        return preview
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request, if enabled."""
